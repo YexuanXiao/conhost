@@ -1,0 +1,362 @@
+# Progress Log
+
+## 2026-02-16
+- Implemented VT insert/replace mode (IRM, `CSI 4 h` / `CSI 4 l`) for printable output when `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is enabled:
+  - `ScreenBuffer` now tracks `vt_insert_mode_enabled`.
+  - printable output shifts the current line right by one cell before writing when IRM is enabled.
+  - added deterministic unit coverage in `condrv_raw_io_tests.cpp` and a dedicated design doc.
+- Implemented additional VT cursor movement sequences and DECSTBM-aware clamping (non-origin mode):
+  - CHA/HPA (`CSI <col> G` / `CSI <col> \``), VPA (`CSI <row> d`), and CNL/CPL (`CSI <n> E` / `CSI <n> F`).
+  - updated CUU/CUD (`CSI <n> A` / `CSI <n> B`) to clamp within the active DECSTBM region when the cursor starts inside the region, even when origin mode is disabled.
+  - added deterministic unit coverage and a dedicated design doc.
+- Implemented VT reset sequences for the output buffer model:
+  - DECSTR soft reset (`CSI ! p`): resets VT modes/attributes and saved cursor state without clearing the screen.
+  - RIS hard reset (`ESC c`): clears the screen, restores default palette, and homes the cursor.
+  - added deterministic unit coverage and a dedicated design doc.
+- Implemented C1 CSI (U+009B) support in the VT output parser:
+  - `apply_text_to_screen_buffer(...)` now treats `U+009B` as a CSI introducer (equivalent to `ESC [`).
+  - added deterministic unit coverage and a dedicated design doc.
+- Extended minimal SGR support for VT output:
+  - SGR 7/27 toggles `COMMON_LVB_REVERSE_VIDEO`.
+  - SGR 4/24 toggles `COMMON_LVB_UNDERSCORE`.
+  - applying normal colors (`30-37`, `40-47`) now clears the intensity bit set by bright colors (`90-97`, `100-107`) for conhost-like behavior.
+  - implemented lossy extended-color SGR support (`38/48`) by mapping xterm indices and truecolor to the nearest legacy palette entry.
+  - added deterministic unit coverage and updated the SGR design doc.
+- Implemented additional ESC dispatch consumption for VT output:
+  - NEL (`ESC E`) is now treated as a VT line feed with carriage return.
+  - DECALN (`ESC # 8`) fills the screen with `E`, resets scrolling margins/origin mode, and homes the cursor.
+  - generic ESC dispatch sequences (including charset designation) are now consumed as no-ops so escape bytes do not leak to the screen buffer.
+  - added deterministic unit coverage and a dedicated design doc.
+- Implemented streaming VT output parsing across `WriteConsole*` calls:
+  - `ScreenBuffer` now retains a small VT parse state machine so split ESC/CSI/OSC/DCS-like sequences do not leak literal escape bytes into the buffer model.
+  - added deterministic unit coverage for split OSC/CSI/ESC-dispatch and string-terminator cases.
+  - added a dedicated design doc (`condrv_vt_output_streaming.md`) and updated VT docs that previously called out chunk-local parsing limitations.
+
+## 2026-02-14
+- Read and incorporated all constraints from `AGENTS.md`.
+- Created standalone `new/` CMake C++23 project structure.
+- Added roadmap, architecture, and Windows API inventory documentation.
+- Added initial progress tracking document.
+- Implemented first increment modules:
+  - RAII resource wrappers and assertion/error primitives.
+  - CLI compatibility parser based on original OpenConsole argument behavior.
+  - Localizer, config loader, and internal logging library.
+  - Application startup orchestration and child-process launch baseline.
+  - Non-GUI tests wired through CTest.
+- Implemented second increment runtime modules:
+  - Pseudo console (`ConPTY`) session host with explicit RAII wrappers for `HPCON`, handles, and startup attribute lists.
+  - Keyboard input to VT encoder and output pump loop without `<thread>`.
+  - Server/signal handle validation path and runtime integration.
+  - Compatibility handling for `-Embedding` mode (non-failing runtime path).
+  - Additional tests for key encoding and server handle validation.
+- Added runtime mode selection logic that prefers ConPTY when headless, explicitly requested, signal-driven, or pipe-transported.
+- Added configuration toggles for pseudo console preference and `-Embedding` passthrough behavior.
+- Implemented startup launch-policy behavior mirroring original `exemain.cpp`:
+  - Reads `HKCU\\Console\\ForceV2`.
+  - Applies `-ForceV1` override.
+  - Disables legacy path when in ConPTY mode.
+  - Activates `ConhostV1.dll` via `ConsoleCreateIoThread` when legacy mode is selected.
+- Added launch policy tests.
+- Removed `MAX_PATH`, `GetTempPath*`, and `GetTempFileName*` usage in `new/` test/runtime code, replacing temp path discovery with environment-variable based logic and long-path-safe path handling.
+- Added startup command fallback behavior matching conhost cmdline launch semantics:
+  - When no explicit client command is provided in create-server mode, default to `%WINDIR%\\system32\\cmd.exe` (with stable fallback).
+  - Added tests for startup command resolution.
+- Added additional conhost behavior parity in VT/conpty startup:
+  - `--inheritcursor` now triggers a startup cursor-position request sequence in conpty mode.
+  - Added DA1/focus/win32-input-mode startup handshake in conpty mode.
+  - `-ForceNoHandoff` flag is parsed and propagated through session options.
+  - Removed hard failure path for `-Embedding` configuration; compatibility mode continues execution.
+- Added conhost-like command-line expansion behavior before child process creation (`ExpandEnvironmentStringsW`) in runtime spawn paths.
+- Improved ConPTY pump loop throughput/idle behavior:
+  - avoids unconditional sleeps while data is flowing.
+  - yields only when no input/output work was performed.
+  - added a non-GUI unit test that exercises the pseudo-console runtime path.
+- Added architecture analysis/module partition/behavior matrix documentation files derived from local source tree and build graph.
+- Implemented COM local-server registration path for `-Embedding`:
+  - `CoRegisterClassObject` single-use registration.
+  - `IConsoleHandoff`/`IDefaultTerminalMarker` COM object with handle duplication contract.
+  - process-handle return path for handoff caller.
+  - configurable embedding wait timeout.
+- Improved `-Embedding` handoff lifecycle handling:
+  - captures portable attach message + duplicated handle payload.
+  - propagates `EstablishHandoff` failure details through `ComEmbeddingServer::run`.
+  - validates server handle in post-handoff flow and blocks on inbox-process lifetime when available.
+  - added deterministic success-path unit test using COM activation from a helper thread.
+- Replaced slow integer parsing paths (`std::stoi`, `std::stoul`, `wcstoul`) with fast independent numeric serdes module (`serialization/fast_number`) using `charconv` + manual wide parsing.
+- Added float serialization/deserialization APIs and tests for numeric round-trip behavior.
+- Added research documentation with primary internet sources for high-performance number conversion algorithms.
+- Expanded automated non-GUI test coverage substantially:
+  - Added runtime session tests.
+  - Added COM embedding timeout/failure-path tests.
+  - Added CLI/parser edge-case tests.
+  - Added config invalid-input tests.
+  - Added key encoder extended mapping tests.
+  - Added dedicated coverage plan document.
+- Started ConDrv server-mode foundations:
+  - added a minimal ConDrv protocol definition header (`condrv_protocol.hpp`).
+  - added a layout-stable `IOCTL_CONDRV_READ_IO` packet definition (`condrv_packet.hpp`).
+  - added a `DeviceIoControl`-based ConDrv device communication wrapper (`ConDrvDeviceComm`).
+  - added a minimal API message wrapper for ConDrv input/output buffers (`condrv_api_message.hpp`) plus unit tests.
+  - added non-GUI unit tests for protocol/layout and invalid-handle behavior.
+- Added a microtask breakdown document to guide incremental porting (`docs/microtask_backlog.md`).
+- Fixed CLI handle parsing to accept pointer-width (`uintptr_t`) hex values:
+  - added `parse_hex_u64` in `serialization/fast_number`.
+  - switched `--server`/`--signal` parsing to store full pointer-width values.
+  - added a unit test covering >32-bit handle values on 64-bit builds.
+- Expanded ConDrv message completion support:
+  - added `set_completion_write_data` to `ConDrvApiMessage` so CONNECT replies can carry `CD_CONNECTION_INFORMATION`.
+  - added unit tests verifying completion write payload copying.
+- Implemented the first runnable ConDrv server-mode loop:
+  - added `condrv/condrv_server` with a minimal dispatcher and server state.
+  - implemented CONNECT/DISCONNECT and CREATE_OBJECT/CLOSE_OBJECT stubs for current input/output handles.
+  - implemented a small USER_DEFINED API subset (Get/SetMode, GetCP, GetNumberOfInputEvents) with inline reply writes.
+  - wired `--server` startup to run the ConDrv server loop from `runtime::Session`.
+  - added deterministic unit tests for dispatcher lifecycle and object handling.
+- Tightened RAII and standard-library-style handle usage across `new/`:
+  - added `core::HandleView::from_uintptr`/`as_uintptr` to keep integer-handle conversions localized.
+  - added `UniqueHandle::view()` for explicit borrowed-handle access without exposing raw `HANDLE` variables.
+  - updated `core::win32_handle` duplication helpers to avoid raw `HANDLE` temporaries using `UniqueHandle::put()`.
+  - added `core::wait_for_two_objects` to localize `WaitForMultipleObjects` handle-array creation.
+  - refactored `condrv::ConDrvServer` signal monitor and `runtime::Session` inherited-stdio wait logic to use the new wrappers.
+  - updated unit tests to avoid raw `HANDLE` casts and fixed invalid-handle tests after making `HandleView(HANDLE)` explicit.
+- Simplified Win32 exception transport:
+  - replaced the `Win32Exception` wrapper class with `enum class core::Win32Error : DWORD`.
+  - updated `throw_last_error` and the top-level exception handler (`wmain`) to throw/catch `Win32Error` values directly.
+- Expanded ConDrv server-mode behavior for basic IO:
+  - added a minimal host IO abstraction and implemented `CONSOLE_IO_RAW_WRITE`/`CONSOLE_IO_RAW_READ` handling.
+  - added an input monitor thread + in-memory byte queue that drives the ConDrv `InputAvailableEvent` (manual reset) for basic read wakeups.
+  - updated `runtime::Session` to pass host stdio handles into the ConDrv server loop.
+  - added `ConsolepSetCP` handling (input/output code page updates).
+  - added deterministic unit tests for raw read/write dispatch and output-buffer writeback.
+- Expanded USER_DEFINED console state APIs used by many classic CLI applications:
+  - implemented L2 screen buffer + cursor operations (GetScreenBufferInfo, Get/SetCursorInfo, SetCursorPosition, SetTextAttribute, SetScreenBufferSize, GetLargestWindowSize).
+  - added deterministic unit tests covering cursor/screen-buffer state round-trips.
+- Implemented a minimal in-memory screen buffer content model for ConDrv server-mode:
+  - added L2 output-buffer operations (FillConsoleOutput, Read/WriteConsoleOutputString, Read/WriteConsoleOutput, ScrollConsoleScreenBuffer).
+  - added L2 title operations (GetTitle/SetTitle) and SetScreenBufferInfo handling.
+  - added FlushInputBuffer support (clears the internal byte queue; no `INPUT_RECORD` model yet).
+  - expanded non-GUI tests to cover output buffer contents, scrolling, and title round-trips.
+- Expanded ConDrv input handling for classic input APIs:
+  - implemented `ConsolepGetConsoleInput` (Peek/ReadConsoleInput semantics) with minimal `INPUT_RECORD` synthesis (byte queue -> `KEY_EVENT` records).
+  - implemented conhost-style reply-pending waits for input-dependent operations:
+    - `dispatch_message(...)` never blocks waiting for input.
+    - reads that would block return `reply_pending=true` and are queued/retried by the server loop when input arrives.
+    - server wake uses `CancelSynchronousIo` guarded by "pending replies" and "in driver read" flags to avoid canceling unrelated IO.
+  - implemented `ConsolepWriteConsoleInput` to inject keydown character events into the byte queue (supports `Append` behavior).
+  - updated `ConsolepGetNumberOfInputEvents` to report queued input bytes.
+  - added deterministic tests for peek/remove semantics and input injection.
+  - added deterministic unit tests that validate reply-pending + retry behavior, including split UTF-8 sequences and disconnect failure completion.
+- Expanded ConDrv object/API compatibility:
+  - Implemented multi-screen-buffer support: `io_object_type_new_output` now allocates a distinct in-memory `ScreenBuffer` per output handle.
+  - Implemented `ConsolepSetActiveScreenBuffer` semantics and ensured `io_object_type_current_output` handle creation binds to the active buffer.
+  - Added deterministic dispatcher tests for per-buffer isolation and active-buffer switching behavior.
+  - Implemented `ConsolepGenerateCtrlEvent` forwarding using the `-Embedding` host-signal pipe (`HostSignals::end_task`) when available.
+  - Implemented lightweight stubs for `ConsolepGetLangId` and `ConsolepNotifyLastClose` to avoid failing common call paths.
+- Expanded COM `-Embedding` handoff to transfer into the ConDrv server loop:
+  - added `condrv::ConDrvServer::run_with_handoff` to complete the portable attach descriptor before entering the main IO loop.
+  - added `ComEmbeddingServer::run_with_runner` to keep COM handshake tests deterministic while the default runner starts the ConDrv server.
+  - updated COM embedding unit tests to validate the captured handoff payload without requiring a real ConDrv server handle.
+- Implemented host-signal pipe wire encoding helpers (`core::write_host_signal_packet`) and added unit tests for the EndTask packet layout.
+
+## 2026-02-15
+- Implemented additional common USER_DEFINED L3 query APIs for classic clients:
+  - `ConsolepGetConsoleWindow` (headless stub returns null/0).
+  - `ConsolepGetDisplayMode` (returns 0 flags in headless mode).
+  - `ConsolepGetKeyboardLayoutName` (returns an 8-hex-digit KL name via `GetKeyboardLayoutNameW`, with a stable fallback).
+  - `ConsolepGetMouseInfo` (reports mouse buttons via `GetSystemMetrics(SM_CMOUSEBUTTONS)`).
+  - `ConsolepGetSelectionInfo` (headless stub returns no selection).
+  - `ConsolepGetConsoleProcessList` (reports required size when the buffer is too small; writes newest-to-oldest PID list when sufficient).
+- Implemented additional USER_DEFINED L3 compatibility APIs used by `doskey`-style workflows:
+  - Alias APIs: `ConsolepAddAlias`, `ConsolepGetAlias`, `ConsolepGetAliasesLength`, `ConsolepGetAliases`, `ConsolepGetAliasExesLength`, `ConsolepGetAliasExes`.
+  - Alias keys are normalized using `LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE)` so lookups are case-insensitive without locale dependencies.
+- Implemented minimal USER_DEFINED L3 history APIs:
+  - `ConsolepGetHistory` / `ConsolepSetHistory` store and return in-memory history settings.
+  - Command history APIs are stubbed to succeed and return empty history (`ConsolepGetCommandHistoryLength`, `ConsolepGetCommandHistory`, `ConsolepSetNumberOfCommands`, `ConsolepExpungeCommandHistory`).
+- Implemented additional USER_DEFINED font/display compatibility APIs:
+  - `ConsolepGetNumberOfFonts`, `ConsolepGetFontInfo`, `ConsolepGetFontSize`.
+  - `ConsolepGetCurrentFont` / `ConsolepSetCurrentFont` (in-memory state + deterministic defaults).
+  - `ConsolepSetDisplayMode` (headless stub returns current buffer dimensions).
+  - `ConsolepSetFont` is accepted as a success-only compatibility stub (deprecated in the inbox host).
+- Implemented `ConsolepSetWindowInfo` relative mode (`Absolute == FALSE`) by applying deltas to the current window region.
+- Implemented additional USER_DEFINED L3 compatibility stubs commonly probed by legacy clients:
+  - `ConsolepSetKeyShortcuts`, `ConsolepSetMenuClose`.
+  - `ConsolepCharType` (returns `CHAR_TYPE_SBCS` for in-range coordinates).
+  - `ConsolepSetLocalEUDC` (accepted as a no-op stub).
+  - `ConsolepSetCursorMode` / `ConsolepGetCursorMode` (in-memory state round-trips).
+  - `ConsolepSetNlsMode` / `ConsolepGetNlsMode` (in-memory state round-trips).
+  - `ConsolepRegisterOS2`, `ConsolepSetOS2OemFormat` (accepted as no-op state toggles).
+- Improved USER_DEFINED `ConsolepWriteConsole` behavior:
+  - still forwards bytes to the host IO sink in headless mode.
+  - now also updates the in-memory `ScreenBuffer` model (characters + current attributes) and advances the cursor.
+  - implements minimal processed-output control characters (`\\r`, `\\n`, `\\b`, `\\t`) plus wrap-at-EOL behavior.
+- Added deterministic unit tests for the new L3 query APIs.
+- Added deterministic unit tests for L3 aliases and history stubs.
+- Added deterministic unit tests for the new font APIs and relative `SetWindowInfo` behavior.
+- Added deterministic unit tests for the new cursor/NLS/char-type compatibility behavior.
+- Added deterministic unit tests verifying `WriteConsole` updates screen buffer contents (via `ReadConsoleOutputString`).
+- Updated documentation (`microtask_backlog.md`, `test_coverage_plan.md`, `windows_apis.md`).
+- Implemented a correct ConDrv viewport/scroll-position model for the in-memory `ScreenBuffer`:
+  - `ScreenBuffer` now stores an inclusive `SMALL_RECT` window rect (origin + size) instead of a size-only window.
+  - `ConsolepGetScreenBufferInfo` now reports `ScrollPosition` and the inbox-conhost `CurrentWindowSize` delta encoding (`Right-Left`, `Bottom-Top`).
+  - `ConsolepSetWindowInfo` now updates viewport origin and size (absolute and relative modes).
+  - `ConsolepSetCursorPosition` and `ConsolepWriteConsole` now snap the viewport to keep the cursor visible.
+  - Added a dedicated design doc and unit tests for viewport behavior.
+- Implemented UTF-8-aware ConDrv input decoding for the byte-stream-backed input queue:
+  - `ConsolepReadConsole` (Unicode) now decodes UTF-8/code-page bytes into UTF-16 and consumes the correct number of bytes.
+  - `ConsolepGetConsoleInput` now decodes UTF-8/code-page bytes into `KEY_EVENT` records and consumes the correct number of bytes when not peeking.
+  - `ConsolepWriteConsoleInput` now encodes injected Unicode characters using the configured input code page (UTF-8 supported).
+  - `ConsolepGetNumberOfInputEvents` now counts UTF-16 code units for UTF-8 input (instead of raw bytes).
+  - Added a dedicated design doc and unit tests covering UTF-8 decoding behavior.
+- Implemented ConDrv raw I/O parity behavior matching inbox conhost routing via `IoSorter.cpp`:
+  - `console_io_raw_write` now forwards bytes and also updates the in-memory `ScreenBuffer` model (code page decode + processed output).
+  - `console_io_raw_read` now implements the inbox `ProcessControlZ` behavior (CTRL+Z returns 0 bytes but only consumes the marker byte).
+  - `console_io_raw_flush` now flushes the host input buffer for input handles.
+  - Added a dedicated design doc and unit tests for raw I/O semantics.
+- Implemented `DISABLE_NEWLINE_AUTO_RETURN` output-mode handling in the `ScreenBuffer` write path:
+  - processed-output `\\n` now preserves the cursor column when the flag is set (LF-only) and resets to column 0 when clear (CRLF translation).
+  - added a dedicated design doc and unit tests validating newline translation in the buffer model.
+- Implemented minimal output VT processing for the in-memory `ScreenBuffer` model:
+  - when `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is set, CSI sequences are consumed (not printed) and a minimal subset is applied to the buffer model:
+    - SGR (`ESC[...m`) updates the current text attributes.
+    - cursor positioning/movement (`H`/`f`, `A`/`B`/`C`/`D`) updates the cursor location used for subsequent writes.
+    - erase-in-display/line (`J`/`K`) clears cells by filling spaces with the current attributes.
+  - added a dedicated design doc and unit tests validating SGR attribute application, escape sequence stripping, CUP cursor positioning, and ED/EL clearing behavior.
+- Implemented minimal OSC window-title processing for VT output:
+  - consumes OSC title sequences (`OSC 0/1/2/21 ; <title> BEL/ST`) when `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is set.
+  - updates the title state surfaced by `ConsolepGetTitle` and ensures OSC bytes are not rendered into the `ScreenBuffer`.
+  - added a dedicated design doc and unit test.
+- Implemented minimal DSR/CPR reply injection for VT output:
+  - consumes DSR requests (`CSI 5n` / `CSI 6n`) when `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is set.
+  - injects replies into the input queue when hosted without an external terminal (policy-driven).
+  - added a dedicated design doc and unit tests.
+- Implemented conhost-compatible `ConsolepSetMode` validation/semantics:
+  - input mode applies even when returning `STATUS_INVALID_PARAMETER` for invalid combinations/unknown bits.
+  - output mode rejects unknown bits and does not apply invalid values.
+  - added a dedicated design doc and unit tests covering both input and output mode behavior.
+- Implemented VT cursor save/restore support in the in-memory `ScreenBuffer` model:
+  - consumes DECSC/DECRC `ESC7`/`ESC8` and CSI `ESC[s`/`ESC[u` when `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is set.
+  - restores both cursor position and active text attributes for subsequent writes.
+  - added a dedicated design doc and unit tests for both sequence forms.
+- Implemented minimal VT mode toggle support for cursor visibility (DECTCEM):
+  - consumes `ESC[?25l` (hide) and `ESC[?25h` (show) when `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is set.
+  - updates the `ScreenBuffer` cursor visibility state surfaced by `ConsolepGetCursorInfo`.
+  - added a dedicated design doc and unit tests.
+- Implemented minimal cooked line-input behavior for `ConsolepReadConsole` when `ENABLE_LINE_INPUT` is set:
+  - buffers input until CR/LF; appends CRLF when `ENABLE_PROCESSED_INPUT` is set (otherwise CR).
+  - supports backspace editing, optional echo (`ENABLE_ECHO_INPUT`), and small-buffer pending output.
+  - avoids spinning on split UTF-8/DBCS sequences by draining incomplete prefixes into a per-handle buffer and reply-pending until the sequence completes.
+  - added a dedicated design doc and unit tests; updated existing raw `ReadConsole` tests to disable line input explicitly.
+- Improved raw `ReadConsoleW` UTF-8/DBCS decode behavior to avoid busy-spins on split sequences:
+  - when the head of the byte queue is an incomplete multibyte sequence and the read has not produced any output yet, the server drains the partial bytes into a per-handle prefix buffer and returns `reply_pending=true`.
+  - added deterministic reply-pending + retry unit tests for the split-sequence case.
+- Improved `ConsolepGetConsoleInput` (ReadConsoleInput) blocking semantics for split UTF-8/DBCS sequences:
+  - removing reads with wait allowed now drain partial multibyte sequences into a per-handle prefix buffer and reply-pend until completion before returning records.
+  - added deterministic reply-pending + retry unit tests for the split-sequence case.
+- Improved UTF-8/code-page surrogate handling for input APIs when caller buffers are too small:
+  - raw `ConsolepReadConsoleW` now splits decoded surrogate pairs across reads by returning the first UTF-16 code unit and stashing the second in `ObjectHandle::decoded_input_pending`.
+  - `ConsolepGetConsoleInput` now returns pending decoded units before waiting/decoding and can split surrogate pairs across removing reads (so it does not return success with 0 records when only a surrogate pair is queued).
+  - `ConsolepGetNumberOfInputEvents` now includes pending decoded units; `ConsolepFlushInputBuffer` and `console_io_raw_flush` clear them.
+  - added unit tests covering surrogate pair split behavior (U+1F600).
+- Implemented minimal processed-input Ctrl+C handling for `ConsolepReadConsole`:
+  - cooked line-input reads now terminate with `STATUS_ALERTED` and forward `CTRL_C_EVENT` via the host-signal pipe.
+  - raw `ReadConsole` consumes `0x03` and forwards `CTRL_C_EVENT` without terminating the read.
+  - `console_io_raw_read` consumes `0x03` and forwards `CTRL_C_EVENT` without terminating the read.
+  - added a dedicated design doc and unit tests.
+- Improved processed-input Ctrl+C handling for raw reads:
+  - `ConsolepReadConsole` raw (ANSI/Unicode) now filters Ctrl+C (`0x03`) even when it appears mid-buffer and continues reading/decoding to fill the caller buffer with non-control input when available.
+  - `console_io_raw_read` now filters mid-buffer Ctrl+C and still honors `ProcessControlZ` semantics (CTRL+Z at start returns 0 bytes).
+  - added unit tests for mid-buffer Ctrl+C cases and updated the Ctrl+C design doc.
+- Implemented processed-input Ctrl+C filtering for `ConsolepGetConsoleInput` (ReadConsoleInput/PeekConsoleInput):
+  - Ctrl+C (`0x03`) is not delivered as a `KEY_EVENT` input record when processed input is enabled.
+  - decode continues past Ctrl+C so callers can still receive the requested number of records when additional input exists.
+  - removing reads forward consumed Ctrl+C as `CTRL_C_EVENT` via the host-signal pipe.
+  - added unit tests and updated the Ctrl+C design doc.
+- Implemented conhost-style reply-pending waits end-to-end in the ConDrv server loop:
+  - `dispatch_message(...)` no longer blocks waiting for input; input-dependent operations return `reply_pending=true`.
+  - the server loop queues pending requests and retries them before reading new driver IO.
+  - input arrival wakes the server thread safely via `CancelSynchronousIo` guarded by "pending replies" and "in driver read" flags.
+  - added a dedicated design doc and updated deterministic unit tests to validate reply-pending + retry behavior.
+- Implemented VT input decoding for ConPTY win32-input-mode (`ESC[?9001h`) and a minimal set of escape keys:
+  - added a VT-first input token decoder that parses win32-input-mode key sequences (`CSI ... _`), consumes DA1/focus control responses, and recognizes common special keys (arrows/home/end/ins/del/pgup/pgdn/F1-F4).
+  - integrated decoding into `ConsolepGetConsoleInput` and `ConsolepReadConsole` (cooked + raw, Unicode + ANSI) with reply-pending behavior for partial sequences (no blocking waits inside dispatch).
+  - increased the per-handle drained-prefix buffer to 64 bytes to accommodate VT prefixes.
+  - added deterministic unit tests and a dedicated design doc.
+- Extended VT input decoding coverage to raw byte reads:
+  - `console_io_raw_read` now consumes win32-input-mode and supported control sequences (DA1/focus) so escape bytes do not leak to applications in ConPTY scenarios.
+  - processed-input Ctrl+C filtering now recognizes win32-input-mode Ctrl+C key events in `console_io_raw_read`.
+  - added raw I/O unit tests covering win32-input-mode decoding, control-sequence consumption, and reply-pending for split VT prefixes.
+- Implemented minimal processed-input Ctrl+Break handling when virtual-key metadata is available (ConPTY win32-input-mode):
+  - Ctrl+Break (`VK_CANCEL` with Ctrl pressed) now flushes input, forwards `CTRL_BREAK_EVENT`, and terminates raw/cooked reads with `STATUS_ALERTED`.
+  - implemented for `ConsolepReadConsole` (cooked + raw), `ConsolepGetConsoleInput` (filtered; does not terminate), and `console_io_raw_read`.
+  - added unit tests validating flush + forwarding + termination semantics.
+- Started the classic renderer/UI track with a non-GUI, unit-testable text measurement module:
+  - added renderer interfaces (`TextMeasurer`, `FontRequest`, `FontMetrics`) and a DirectWrite-backed implementation that resolves fonts from the system collection and computes cell metrics (width/height/baseline) from font-face design units and DPI.
+  - added deterministic unit tests validating basic metrics, missing-font fallback to `Consolas`, and approximate linear scaling with DPI and point size.
+  - added a dedicated design doc and updated the Windows API inventory.
+- Adjusted the executable to behave like a windowed host process:
+  - built `openconsole_new.exe` with the Windows subsystem (GUI entrypoint) to avoid automatically attaching to an existing console host instance.
+  - switched the entrypoint to `wWinMain` (no behavioral change to argument parsing; still uses `GetCommandLineW`).
+- Added a minimal windowed renderer skeleton for classic (non-headless) hosting:
+  - implemented a `WindowHost` module (Win32 class registration, create window, message pump, `WM_SIZE`/`WM_PAINT`).
+  - paints using Direct2D + DirectWrite (placeholder text for now) with RAII-managed COM pointers via C++/WinRT `winrt::com_ptr`.
+  - integrated into server-handle startup: when `--server` is used and not in ConPTY/headless mode, the ConDrv server runs on a worker thread and the window message pump runs on the main thread; closing the window signals a stop event to terminate the server loop.
+  - added a design doc and updated the microtask backlog.
+
+## 2026-02-15
+- Connected the ConDrv in-memory `ScreenBuffer` model to the classic window host:
+  - added a `ScreenBufferSnapshot` + `PublishedScreenBuffer` module for thread-safe viewport snapshot publication.
+  - added `ScreenBuffer::revision()` and best-effort revision tracking for visible mutations.
+  - updated the ConDrv server loop to publish viewport snapshots after completed requests and post `WM_APP + 1` to request repaints.
+  - updated `renderer::WindowHost` to paint the latest snapshot in monochrome using Direct2D + DirectWrite (with per-window DPI scaling).
+  - added deterministic unit tests for viewport snapshot cropping, attribute capture, and revision increments.
+- Improved COM embedding test determinism by allowing in-proc activation of the registered class object (tests no longer depend on global registry state).
+- Implemented explicit handlers for deprecated USER_DEFINED ConDrv APIs (MapBitmap + legacy L3 UI/VDM/hardware-state APIs):
+  - return `STATUS_NOT_IMPLEMENTED` with `Information=0` (matching the upstream "deprecated API" behavior).
+  - sanitize the returned API-descriptor bytes (zero-filled) so replies are deterministic and do not reflect client-provided input fields.
+  - added a unit test covering all deprecated API numbers and an "unknown API" sanitized fallback case.
+  - added a dedicated design doc.
+
+## 2026-02-16
+- Implemented VK-based cooked line-editing for `ConsolepReadConsole` when `ENABLE_LINE_INPUT` is set:
+  - added per-input-handle persisted state (`cooked_line_cursor`, `cooked_insert_mode`) to resume editing across reply-pending waits.
+  - added support for common editing keys: Left/Right/Home/End/Insert/Delete/Escape and Ctrl+Home/End, plus Ctrl+Left/Right word navigation (space/tab delimiter heuristic).
+  - updated echo behavior to keep the on-screen cursor correct when editing mid-line by rewriting the tail and using backspaces/spaces (no VT cursor moves required).
+  - added deterministic unit tests for insert-in-middle, overwrite toggle, delete-in-middle, mid-line Enter, Escape clear, and Ctrl+Home/Ctrl+End.
+  - added a dedicated design doc.
+- Implemented VT scroll margins and vertical line operations for the output buffer model:
+  - added persisted DECSTBM state (`ScreenBuffer::VtVerticalMargins`) and resize clamping.
+  - updated VT output handling to apply:
+    - DECSTBM (`CSI r`) scroll regions
+    - SU/SD (`CSI S`/`CSI T`) scrolling within margins
+    - IL/DL (`CSI L`/`CSI M`) insert/delete line within margins
+    - IND/RI (`ESC D`/`ESC M`) index/reverse-index semantics
+  - added deterministic unit tests covering margins + line feed scrolling, SU/SD, IL/DL, and IND column preservation.
+  - added a dedicated design doc.
+- Implemented VT horizontal editing controls for the output buffer model:
+  - added ICH/DCH/ECH support (CSI `@`/`P`/`X`) to mutate a single line without printing escape bytes.
+  - added deterministic unit tests for insert/delete/erase behavior.
+  - added a dedicated design doc.
+- Implemented VT alternate screen buffer semantics for the output buffer model:
+  - added DECSET/DECRST `CSI ?1049h/l` support by swapping cell storage and backing up main-screen state.
+  - restores cursor position, attributes, cursor visibility/size, saved cursor state, and DECSTBM margins when exiting.
+  - updated screen-buffer resizing to keep both the active and saved cell vectors consistent while in alternate mode.
+  - added deterministic unit tests and a dedicated design doc.
+- Implemented VT autowrap + delayed wrap semantics for the output buffer model:
+  - added DECAWM mode toggles (`CSI ?7h`/`CSI ?7l`) with a persisted delayed-wrap ("last column") flag.
+  - delayed wrap now matches the conhost-style behavior where the wrap is applied only when the next printable character is emitted and only if the cursor did not move in the meantime.
+  - ensured ED/EL and ICH/DCH/ECH reset the delayed-wrap flag (matching upstream expectations).
+  - added deterministic unit tests and a dedicated design doc.
+- Implemented VT origin mode semantics for the output buffer model:
+  - added DECOM mode toggles (`CSI ?6h`/`CSI ?6l`) with cursor homing to the DECSTBM top margin when enabled.
+  - CUP (`CSI H`/`CSI f`) and vertical cursor motion now use origin-mode-relative addressing and clamp within DECSTBM margins.
+  - cursor save/restore includes origin mode.
+  - added deterministic unit tests and a dedicated design doc.
+
+## Next Milestone
+
+- Higher-level **process-isolated integration tests** for the server/runtime beyond the in-memory ConDrv harness.
+- **COM `-Embedding` end-to-end** test harness (beyond current unit coverage).
+- Additional compatibility/hardening: more CLI edge-case parity tests; stress/fuzz-style malformed-input tests.
+- Classic conhost window/UI parity is still incomplete: `WindowHost` now renders the `ScreenBuffer` viewport text (monochrome, snapshot-based), but it does not yet render attributes/colors/cursor and there is no selection/clipboard/scrollbars/IME/accessibility or window input injection (`new/docs/microtask_backlog.md`, `new/docs/conhost_behavior_imitation_matrix.md`).
+- Integration testing is missing: no process-isolated end-to-end tests that run real client programs against `--server` and validate observable behavior (`new/docs/microtask_backlog.md`).
+- Hardening/perf backlog remains: CLI edge-case parity tests, stress tests (Unicode/malformed input/high-volume I/O), and perf instrumentation hooks are not done (`new/docs/microtask_backlog.md`).

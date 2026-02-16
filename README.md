@@ -1,0 +1,32 @@
+# OpenConsole Reimplementation (Incremental)
+
+This folder contains a clean-room, incremental reimplementation of OpenConsole
+using modern C++23, CMake, and Windows SDK APIs.
+
+Current status:
+- Foundation architecture and roadmap documentation are in `docs/`.
+- Source architecture analysis is documented in:
+  - `docs/conhost_source_architecture.md`
+  - `docs/conhost_module_partition.md`
+  - `docs/conhost_behavior_imitation_matrix.md`
+  - `docs/number_serdes_research.md`
+  - `docs/test_coverage_plan.md`
+- A new executable entrypoint and compatibility-focused command-line parser are implemented.
+- A ConPTY-backed runtime session host is implemented for headless/pipe modes.
+- Non-GUI unit tests are included and wired through CTest.
+
+Build:
+```powershell
+cmake -S new -B build-new -G Ninja -DCMAKE_CXX_COMPILER=clang-cl
+cmake --build build-new
+ctest --test-dir build-new --output-on-failure
+```
+
+Key runtime configuration environment variables:
+- `OPENCONSOLE_NEW_CONFIG`: optional config file path.
+- `OPENCONSOLE_NEW_LOG_LEVEL`: `trace|debug|info|warning|error`.
+- `OPENCONSOLE_NEW_LOG_FILE`: optional log file path.
+- `OPENCONSOLE_NEW_PREFER_PTY`: `1` (default) or `0`.
+- `OPENCONSOLE_NEW_ALLOW_EMBEDDING_PASSTHROUGH`: `1` (default) or `0`.
+- `OPENCONSOLE_NEW_ENABLE_LEGACY_PATH`: `1` (default) or `0`.
+- `OPENCONSOLE_NEW_EMBEDDING_WAIT_MS`: `0` (default, infinite) or timeout in milliseconds.
