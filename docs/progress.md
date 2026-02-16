@@ -33,11 +33,25 @@
   - added a dedicated design doc (`condrv_vt_output_streaming.md`) and updated VT docs that previously called out chunk-local parsing limitations.
 - Completed higher-level process-isolated integration test coverage (beyond the in-memory ConDrv harness):
   - `process_integration_tests.cpp` launches `openconsole_new.exe` and validates the headless ConPTY runtime path (`--headless --vtmode`) including exit-code propagation and piped-stdin reachability.
+  - added a headless ConDrv `--server` end-to-end smoke test that creates a real ConDrv server instance, spawns `openconsole_new.exe` to host it, and runs a console client against it to validate basic input/output forwarding.
+  - extended the headless ConDrv `--server` harness to validate win32-input-mode decoding end-to-end (`ReadConsoleInputW` receives `KEY_EVENT` records with virtual key metadata).
   - added deterministic per-run log capture for debugging failures.
   - fixed ConPTY client spawning so redirected host stdin is not observed by the client as direct (EOF) input; stdin is routed through the pseudo console transport while stdout/stderr remain observable by the host.
+- Hardened ConDrv server loop cancellation behavior:
+  - `release_message_buffers()` and `complete_io()` retries transient `ERROR_OPERATION_ABORTED`/`ERROR_CANCELLED` results so `CancelSynchronousIo` wakeups do not terminate the server after it already serviced client requests.
 - Completed COM `-Embedding` end-to-end integration harness:
   - added a proxy/stub DLL build from the inbox IDL (MIDL) and per-user registry wiring for deterministic out-of-proc COM activation in tests.
   - exercised `IConsoleHandoff::EstablishHandoff` end-to-end without relying on the in-memory ConDrv harness.
+- Implemented non-GUI command history support:
+  - added a conhost-style command history pool keyed by CONNECT `ApplicationName` and associated with processes.
+  - cooked line-input `ReadConsole` now records completed lines into history when echo is enabled.
+  - implemented L3 command history APIs: Expunge/SetNumber/GetLength/GetHistory (Unicode + ANSI) and added deterministic unit coverage.
+- Added deterministic stress coverage for numeric conversion (`serialization/fast_number`):
+  - added boundary tests for signed/unsigned integer parsing and hex parsing.
+  - added deterministic round-trip stress loops for integer and floating-point formatting/parsing.
+- Expanded CLI parity tests for argument parsing and escaping:
+  - added tests ensuring `--` and "unknown token" boundaries prevent further host-flag parsing.
+  - added `CommandLineToArgvW`-based round-trip tests for space/trailing-backslash arguments in the reconstructed client command line.
 
 ## 2026-02-14
 - Read and incorporated all constraints from `AGENTS.md`.
@@ -330,6 +344,10 @@
   - updated echo behavior to keep the on-screen cursor correct when editing mid-line by rewriting the tail and using backspaces/spaces (no VT cursor moves required).
   - added deterministic unit tests for insert-in-middle, overwrite toggle, delete-in-middle, mid-line Enter, Escape clear, and Ctrl+Home/Ctrl+End.
   - added a dedicated design doc.
+- Added deterministic fuzz-style hardening coverage for VT parsing (non-GUI):
+  - added `condrv_vt_fuzz_tests.cpp` to exercise the VT input decoder (`vt_input::try_decode_vt`) and the streaming VT output parser (`apply_text_to_screen_buffer`) with malformed/randomized inputs.
+  - validated invariants (no zero-byte-consumed tokens, cursor/window/buffer bounds, monotonic revision) and added targeted bounds tests for overlong CSI/ESC-dispatch abandonment and OSC title truncation.
+  - added `OPENCONSOLE_NEW_TEST_FUZZ_ITERS` to scale the deterministic fuzz iteration count.
 - Implemented VT scroll margins and vertical line operations for the output buffer model:
   - added persisted DECSTBM state (`ScreenBuffer::VtVerticalMargins`) and resize clamping.
   - updated VT output handling to apply:
@@ -361,14 +379,13 @@
 
 ## Next Milestone
 
-- Higher-level **process-isolated integration tests** for the server/runtime beyond the in-memory ConDrv harness.
-- **COM `-Embedding` end-to-end** test harness (beyond current unit coverage).
-- Additional compatibility/hardening: more CLI edge-case parity tests; stress/fuzz-style malformed-input tests.
+- Expand **process-isolated integration coverage** for the full startup matrix (`-Embedding`, `--server`, `--headless`, legacy policy combinations) and for more ConDrv behaviors beyond the current end-to-end smoke coverage.
+- Add high-volume runtime I/O pump stress tests with synthetic pipe traffic.
 - Classic conhost window/UI parity is still incomplete: `WindowHost` now renders the `ScreenBuffer` viewport text (monochrome, snapshot-based), but it does not yet render attributes/colors/cursor and there is no selection/clipboard/scrollbars/IME/accessibility or window input injection (`new/docs/microtask_backlog.md`, `new/docs/conhost_behavior_imitation_matrix.md`).
-- Integration testing is missing: no process-isolated end-to-end tests that run real client programs against `--server` and validate observable behavior (`new/docs/microtask_backlog.md`).
-- Hardening/perf backlog remains: CLI edge-case parity tests, stress tests (Unicode/malformed input/high-volume I/O), and perf instrumentation hooks are not done (`new/docs/microtask_backlog.md`).
+- Integration testing is still incomplete: there is a process-isolated end-to-end smoke test for `--server --headless`, but broader parity coverage and stress coverage are still pending (`new/docs/microtask_backlog.md`).
+- Hardening/perf backlog remains: high-volume I/O stress tests and perf instrumentation hooks are not done (`new/docs/microtask_backlog.md`).
 
 
-If “non-GUI mode” means headless ConPTY hosting (openconsole_new.exe --headless --vtmode -- <cmd>): the core path is implemented and has process-isolated integration tests (process_integration_tests.cpp) covering output + exit code propagation and piped-stdin reachability.
+If "non-GUI mode" means headless ConPTY hosting (`openconsole_new.exe --headless --vtmode -- <cmd>`): the core path is implemented and has process-isolated integration tests (`process_integration_tests.cpp`) covering output + exit code propagation and piped-stdin reachability.
 
-If “non-GUI mode” means classic conhost replacement in --server ConDrv mode: a large, unit-tested dispatch surface exists (Write/ReadConsole, input queue + reply-pending, VT output parsing, VT win32-input-mode decoding, cooked line editing, etc.), but it is not yet validated end-to-end with a real client process (no process-isolated --server integration harness; test_coverage_plan.md still lists this as a remaining expansion), and there are still parity/hardening gaps tracked in microtask_backlog.md / conhost_behavior_imitation_matrix.md (CLI edge cases, stress/fuzz malformed input, deeper protocol/handoff parity).
+If "non-GUI mode" means classic conhost replacement in `--server` ConDrv mode: a large, unit-tested dispatch surface exists (Write/ReadConsole, input queue + reply-pending, VT output parsing, VT win32-input-mode decoding, cooked line editing, etc.), and there is now a process-isolated `--server --headless` end-to-end smoke test, but broader end-to-end parity coverage and stress coverage are still pending (`new/docs/microtask_backlog.md`, `new/docs/conhost_behavior_imitation_matrix.md`).

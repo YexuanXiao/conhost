@@ -12,7 +12,7 @@ This matrix tracks behavior imitation status against the local conhost source.
 
 ## 2. CLI switch behavior
 
-1. `--server`: Parsed, validated, and serviced via a minimal ConDrv server loop (CONNECT/DISCONNECT/CREATE_OBJECT/CLOSE_OBJECT); deeper API dispatch pending.
+1. `--server`: Parsed, validated, and serviced via a ConDrv server loop with a substantial USER_DEFINED dispatch surface (Read/WriteConsole, input queue + reply-pending, screen buffer model, VT output parsing, VT/win32-input-mode input decoding, cooked line editing, history, etc.). Covered by unit tests and a process-isolated `--server --headless` end-to-end smoke integration test.
 2. `--signal`: Parsed, validated, and used to request termination (via a cancellation monitor) for ConDrv server-mode; also used for the compatibility wait path when no client command is provided in create-server mode.
 3. `--headless`: Parsed and used for conpty mode selection.
 4. `--width` / `--height`: Parsed and used for initial pseudo-console sizing.
@@ -21,7 +21,7 @@ This matrix tracks behavior imitation status against the local conhost source.
 7. `--feature pty`: Parsed and validated.
 8. `-ForceV1`: Parsed and used in launch policy.
 9. `-ForceNoHandoff`: Parsed and propagated.
-10. `-Embedding`: COM local-server registration and `EstablishHandoff` capture implemented (payload/handle duplication + inbox lifecycle wait; console-driver session handoff still partial).
+10. `-Embedding`: COM local-server registration and `EstablishHandoff` path implemented (payload/handle duplication + handoff transfer into the ConDrv server loop). Covered by both unit tests and an out-of-proc COM integration harness.
 11. `--` and implicit client command payload parsing: Implemented.
 
 ## 3. Process startup behavior

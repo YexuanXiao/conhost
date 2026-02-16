@@ -118,6 +118,12 @@ This avoids canceling unrelated synchronous IO and limits cancellation to the in
 The server loop treats `ERROR_OPERATION_ABORTED` / `ERROR_CANCELLED` from `read_io` as a non-fatal wakeup signal when a
 stop is not requested.
 
+Note: `CancelSynchronousIo` is a best-effort wake mechanism. There is an unavoidable race between observing
+`in_driver_read_io == true` and delivering the cancellation, so a different synchronous IOCTL in the server thread can
+still be canceled in rare cases. The server loop therefore treats transient cancellation errors (`ERROR_OPERATION_ABORTED`
+and `ERROR_CANCELLED`) from message buffer release/completion as retryable so the process does not abort after already
+servicing client requests.
+
 ## Flush Semantics
 
 Operations that flush the input queue also clear per-handle decode/cooked state:

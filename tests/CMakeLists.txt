@@ -18,6 +18,7 @@ add_executable(oc_new_tests
     condrv_input_wait_tests.cpp
     condrv_raw_io_tests.cpp
     condrv_screen_buffer_snapshot_tests.cpp
+    condrv_vt_fuzz_tests.cpp
     dwrite_text_measurer_tests.cpp
     process_integration_tests.cpp
 )
@@ -96,6 +97,16 @@ add_executable(oc_new_stdio_probe
     stdio_probe.cpp
 )
 
+add_executable(oc_new_condrv_client_smoke
+    condrv_client_smoke.cpp
+)
+target_link_libraries(oc_new_condrv_client_smoke PRIVATE oc_new_core)
+
+add_executable(oc_new_condrv_client_input_events
+    condrv_client_input_events.cpp
+)
+target_link_libraries(oc_new_condrv_client_input_events PRIVATE oc_new_core)
+
 if(MSVC)
     target_compile_options(oc_new_tests PRIVATE
         /W4
@@ -108,7 +119,7 @@ if(MSVC)
     )
 endif()
 
-add_dependencies(oc_new_tests openconsole_new oc_new_embedding_test_host oc_new_stdio_probe oc_new_openconsole_proxy_dll)
+add_dependencies(oc_new_tests openconsole_new oc_new_embedding_test_host oc_new_stdio_probe oc_new_condrv_client_smoke oc_new_condrv_client_input_events oc_new_openconsole_proxy_dll)
 add_dependencies(oc_new_embedding_test_host oc_new_openconsole_proxy_dll)
 
 add_test(NAME oc_new_tests COMMAND oc_new_tests)

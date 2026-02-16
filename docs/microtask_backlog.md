@@ -20,7 +20,7 @@ Goal: handle `--server` startup and service ConDrv IOs.
 - [x] Implement minimal handle/object model:
   - current input/output handles (placeholder objects)
   - create/close object (current input/output + new output)
-- [ ] Implement minimal API dispatch set for basic CLI apps:
+- [x] Implement minimal API dispatch set for basic CLI apps:
   - [x] USER_DEFINED subset: Get/SetMode, GetCP/SetCP, GetNumberOfInputEvents
   - [x] USER_DEFINED subset: WriteConsole / ReadConsole (forwarding to host IO + in-memory ScreenBuffer updates for WriteConsole; UTF-16 -> UTF-8 for host output)
     - Notes: the buffer model implements minimal processed-output control characters (`\\r`, `\\n`, `\\b`, `\\t`), respects `DISABLE_NEWLINE_AUTO_RETURN` for `\\n`, and consumes minimal VT sequences when `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is set:
@@ -97,14 +97,15 @@ Goal: handle `--server` startup and service ConDrv IOs.
   - [x] USER_DEFINED subset: GenerateCtrlEvent / host-signal pipe semantics (CTRL events forwarded via `HostSignals::end_task` when a host-signal pipe is available; otherwise best-effort no-op)
   - [x] USER_DEFINED subset: L3 misc queries (GetConsoleWindow, GetDisplayMode, GetKeyboardLayoutName, GetMouseInfo, GetSelectionInfo, GetConsoleProcessList)
   - [x] USER_DEFINED subset: L3 aliases (AddAlias/GetAlias, GetAliasesLength/GetAliases, GetAliasExesLength/GetAliasExes)
-  - [x] USER_DEFINED subset: L3 history (GetHistory/SetHistory; command history APIs stubbed to return empty history)
+  - [x] USER_DEFINED subset: L3 history (GetHistory/SetHistory + command history APIs: Expunge/SetNumber/GetLength/GetHistory)
   - [x] USER_DEFINED subset: L3 font/display APIs (GetNumberOfFonts/GetFontInfo/GetFontSize, Get/SetCurrentFont, SetDisplayMode; SetFont accepted as a compatibility stub)
   - [x] USER_DEFINED subset: L3 legacy compatibility stubs (SetKeyShortcuts, SetMenuClose, CharType, CursorMode, NlsMode, OS2 toggles, LocalEUDC)
   - [x] USER_DEFINED deprecated legacy APIs (MapBitmap + legacy UI/VDM/hardware-state APIs): explicitly rejected with `STATUS_NOT_IMPLEMENTED` and sanitized descriptor bytes
-  - [x] Multi-screen-buffer support: `io_object_type_new_output`, `ConsolepSetActiveScreenBuffer`, per-buffer state
+- [x] Multi-screen-buffer support: `io_object_type_new_output`, `ConsolepSetActiveScreenBuffer`, per-buffer state
   - Notes: each output handle now references a `ScreenBuffer` object (separate cell/state storage). `ConsolepSetActiveScreenBuffer` updates the active buffer used by subsequent `io_object_type_current_output` handle creation.
 - [x] Add deterministic unit tests for message parsing and buffer routines.
-- [ ] Add higher-level integration tests with process isolation once core IO paths exist.
+- [x] Add higher-level integration tests with process isolation once core IO paths exist.
+- [x] Extend ConDrv process integration coverage to validate win32-input-mode `ReadConsoleInputW` key-event decoding end-to-end.
 
 ## 2) COM `-Embedding` Handoff (Replacement Delegation)
 
@@ -116,7 +117,7 @@ Goal: accept the inbox conhost handoff and become the active console host.
   - use captured attach message + server handle to resume servicing the pending IO using a single shared server state
   - start server-mode loop against the handed-off driver handle
 - [x] Implement host-signal pipe write-side helpers (initial): `core::write_host_signal_packet` + `HostSignals::end_task` forwarding for `ConsolepGenerateCtrlEvent`.
-- [ ] Add end-to-end tests (requires a harness that can simulate or observe handoff).
+- [x] Add end-to-end tests (requires a harness that can simulate or observe handoff).
 
 ## 3) Renderer/UI (Classic Conhost Window)
 
@@ -131,5 +132,6 @@ Goal: render the console model without relying on WinUI.
 
 ## 4) Hardening and Compatibility
 
-- [ ] Expand CLI parity tests to include more edge-case quoting/escaping behavior.
-- [ ] Add stress tests for numeric conversion and malformed input handling.
+- [x] Expand CLI parity tests to include more edge-case quoting/escaping behavior.
+- [x] Add deterministic fuzz-style malformed-input hardening for VT input/output parsing (VT input decoder + streaming VT output parser).
+- [x] Add stress tests for numeric conversion edge ranges.

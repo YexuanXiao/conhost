@@ -58,9 +58,15 @@ This document lists Windows APIs used by the reimplementation in `new/`.
 - `ResetEvent`
 - `SetFilePointerEx`
 - `GetFileType`
+- `GetModuleHandleW` (tests)
+- `LoadLibraryW` (tests)
 - `LoadLibraryExW`
 - `GetProcAddress`
 - `FreeLibrary`
+
+## NTDLL (Tests Only)
+- `NtOpenFile` (tests)
+- `RtlNtStatusToDosError` (tests)
 
 ## Registry
 - `RegOpenKeyExW`
@@ -76,6 +82,7 @@ This document lists Windows APIs used by the reimplementation in `new/`.
 - `GetUserDefaultLocaleName`
 - `IsDBCSLeadByteEx`
 - `LCMapStringEx`
+- `CompareStringOrdinal`
 - `MultiByteToWideChar`
 - `WideCharToMultiByte`
 

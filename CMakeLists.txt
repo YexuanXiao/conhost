@@ -10,6 +10,7 @@ add_library(oc_new_core STATIC
     src/app/application.cpp
     src/cli/console_arguments.cpp
     src/config/app_config.cpp
+    src/condrv/command_history.cpp
     src/condrv/condrv_device_comm.cpp
     src/condrv/screen_buffer_snapshot.cpp
     src/condrv/condrv_server.cpp

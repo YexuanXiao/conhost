@@ -19,6 +19,7 @@ bool run_condrv_server_dispatch_tests();
 bool run_condrv_input_wait_tests();
 bool run_condrv_raw_io_tests();
 bool run_condrv_screen_buffer_snapshot_tests();
+bool run_condrv_vt_fuzz_tests();
 bool run_dwrite_text_measurer_tests();
 bool run_process_integration_tests();
 
@@ -157,6 +158,13 @@ int main()
     if (!run_condrv_screen_buffer_snapshot_tests())
     {
         fwprintf(stderr, L"[FAIL] condrv screen buffer snapshot tests\n");
+        ++failed;
+    }
+
+    trace(L"condrv vt fuzz");
+    if (!run_condrv_vt_fuzz_tests())
+    {
+        fwprintf(stderr, L"[FAIL] condrv vt fuzz tests\n");
         ++failed;
     }
 

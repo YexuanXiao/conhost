@@ -898,14 +898,45 @@ namespace oc::condrv
             };
 
             const auto release_and_complete = [&](ConDrvApiMessage& message) noexcept -> std::expected<void, ServerError> {
-                if (auto released = message.release_message_buffers(); !released)
+                // `CancelSynchronousIo` is used to wake this thread when input arrives for reply-pending work.
+                // Even with guarding, there is an unavoidable race where the cancellation lands while the
+                // server is completing a different synchronous IOCTL. Treat cancellation errors as transient
+                // and retry a few times so the server does not abort the process after successfully
+                // servicing client requests.
+                constexpr int max_retries = 8;
+
+                for (int attempt = 0;; ++attempt)
                 {
-                    return std::unexpected(make_error(released.error().context, released.error().win32_error));
+                    auto released = message.release_message_buffers();
+                    if (released)
+                    {
+                        break;
+                    }
+
+                    const DWORD error = released.error().win32_error;
+                    if ((error == ERROR_OPERATION_ABORTED || error == ERROR_CANCELLED) && attempt < max_retries)
+                    {
+                        continue;
+                    }
+
+                    return std::unexpected(make_error(released.error().context, error));
                 }
 
-                if (auto completed = message.complete_io(); !completed)
+                for (int attempt = 0;; ++attempt)
                 {
-                    return std::unexpected(make_error(completed.error().context, completed.error().win32_error));
+                    auto completed = message.complete_io();
+                    if (completed)
+                    {
+                        break;
+                    }
+
+                    const DWORD error = completed.error().win32_error;
+                    if ((error == ERROR_OPERATION_ABORTED || error == ERROR_CANCELLED) && attempt < max_retries)
+                    {
+                        continue;
+                    }
+
+                    return std::unexpected(make_error(completed.error().context, error));
                 }
 
                 return {};
@@ -1187,7 +1218,10 @@ namespace oc::condrv
         });
     }
 
-    std::expected<ConnectionInformation, DeviceCommError> ServerState::connect_client(const DWORD pid, const DWORD tid) noexcept
+    std::expected<ConnectionInformation, DeviceCommError> ServerState::connect_client(
+        const DWORD pid,
+        const DWORD tid,
+        const std::wstring_view app_name) noexcept
     {
         auto process_state = make_process_state(pid, tid);
         if (!process_state)
@@ -1254,6 +1288,15 @@ namespace oc::condrv
         process_iter->second->input_handle = input_handle.value();
         process_iter->second->output_handle = output_handle.value();
 
+        // Command history is best-effort: the CONNECT path should remain usable even if
+        // history storage cannot be allocated. This mirrors the upstream behavior where
+        // history allocation failures are caught and logged rather than failing the connect.
+        _command_histories.allocate_for_process(
+            app_name,
+            process_handle,
+            static_cast<size_t>(_history_buffer_count),
+            static_cast<size_t>(_history_buffer_size));
+
         ConnectionInformation info{};
         info.process = process_handle;
         info.input = input_handle.value();
@@ -1268,6 +1311,8 @@ namespace oc::condrv
         {
             return false;
         }
+
+        _command_histories.free_for_process(process_handle);
 
         for (auto object_iter = _objects.begin(); object_iter != _objects.end();)
         {
@@ -1525,6 +1570,46 @@ namespace oc::condrv
         _history_buffer_size = buffer_size;
         _history_buffer_count = buffer_count;
         _history_flags = flags;
+
+        // Global history-buffer-size changes apply to all histories (allocated or cached).
+        _command_histories.resize_all(static_cast<size_t>(buffer_size));
+    }
+
+    CommandHistory* ServerState::try_command_history_for_process(const ULONG_PTR process_handle) noexcept
+    {
+        return _command_histories.find_by_process(process_handle);
+    }
+
+    CommandHistory* ServerState::try_command_history_for_exe(const std::wstring_view exe_name) noexcept
+    {
+        return _command_histories.find_by_exe(exe_name);
+    }
+
+    const CommandHistory* ServerState::try_command_history_for_exe(const std::wstring_view exe_name) const noexcept
+    {
+        return _command_histories.find_by_exe(exe_name);
+    }
+
+    void ServerState::add_command_history_for_process(
+        const ULONG_PTR process_handle,
+        const std::wstring_view command,
+        const bool suppress_duplicates) noexcept
+    {
+        auto* history = _command_histories.find_by_process(process_handle);
+        if (history != nullptr)
+        {
+            history->add(command, suppress_duplicates);
+        }
+    }
+
+    void ServerState::expunge_command_history(const std::wstring_view exe_name) noexcept
+    {
+        _command_histories.expunge_by_exe(exe_name);
+    }
+
+    void ServerState::set_command_history_number_of_commands(const std::wstring_view exe_name, const size_t max_commands) noexcept
+    {
+        _command_histories.set_number_of_commands_by_exe(exe_name, max_commands);
     }
 
     std::shared_ptr<ScreenBuffer> ServerState::active_screen_buffer() const noexcept

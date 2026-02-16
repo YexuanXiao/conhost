@@ -4,18 +4,50 @@
 #include <cstdio>
 #include <cstring>
 #include <optional>
+#include <vector>
 
 namespace
 {
     struct DummyComm final
     {
-        [[nodiscard]] std::expected<void, oc::condrv::DeviceCommError> read_input(oc::condrv::IoOperation& /*operation*/) noexcept
+        std::vector<std::byte> input;
+        std::vector<std::byte> output;
+
+        [[nodiscard]] std::expected<void, oc::condrv::DeviceCommError> read_input(oc::condrv::IoOperation& operation) noexcept
         {
+            const auto offset = static_cast<size_t>(operation.buffer.offset);
+            const auto size = static_cast<size_t>(operation.buffer.size);
+            if (offset + size > input.size())
+            {
+                return std::unexpected(oc::condrv::DeviceCommError{
+                    .context = L"DummyComm read_input out of range",
+                    .win32_error = ERROR_INVALID_DATA,
+                });
+            }
+
+            if (size != 0)
+            {
+                std::memcpy(operation.buffer.data, input.data() + offset, size);
+            }
+
             return {};
         }
 
-        [[nodiscard]] std::expected<void, oc::condrv::DeviceCommError> write_output(oc::condrv::IoOperation& /*operation*/) noexcept
+        [[nodiscard]] std::expected<void, oc::condrv::DeviceCommError> write_output(oc::condrv::IoOperation& operation) noexcept
         {
+            const auto offset = static_cast<size_t>(operation.buffer.offset);
+            const auto size = static_cast<size_t>(operation.buffer.size);
+            if (offset > output.size())
+            {
+                output.resize(offset);
+            }
+
+            output.resize(offset + size);
+            if (size != 0)
+            {
+                std::memcpy(output.data() + offset, operation.buffer.data, size);
+            }
+
             return {};
         }
 
@@ -2101,7 +2133,7 @@ namespace
         return after.HistoryBufferSize == 123 && after.NumberOfHistoryBuffers == 9 && after.dwFlags == 0x55AA;
     }
 
-    bool test_user_defined_command_history_apis_are_stubbed()
+    bool test_user_defined_command_history_apis_succeed_with_empty_history()
     {
         DummyComm comm{};
         oc::condrv::ServerState state{};
@@ -2118,80 +2150,139 @@ namespace
         oc::condrv::ConnectionInformation info{};
         std::memcpy(&info, connect_message.completion().write.data, sizeof(info));
 
+        constexpr std::wstring_view exe = L"cmd.exe";
+        constexpr ULONG header_size = sizeof(CONSOLE_MSG_HEADER);
+        const ULONG exe_bytes = static_cast<ULONG>(exe.size() * sizeof(wchar_t));
+
         // Get length.
-        oc::condrv::IoPacket length_packet{};
-        length_packet.payload.user_defined = oc::condrv::UserDefinedPacket{};
-        length_packet.descriptor.identifier.LowPart = 210;
-        length_packet.descriptor.function = oc::condrv::console_io_user_defined;
-        length_packet.descriptor.process = info.process;
-        length_packet.descriptor.object = info.output;
-        length_packet.payload.user_defined.msg_header.ApiNumber = static_cast<ULONG>(ConsolepGetCommandHistoryLength);
-        length_packet.payload.user_defined.msg_header.ApiDescriptorSize = sizeof(CONSOLE_GETCOMMANDHISTORYLENGTH_MSG);
-
-        oc::condrv::BasicApiMessage<DummyComm> length_message(comm, length_packet);
-        auto length_outcome = oc::condrv::dispatch_message(state, length_message, host_io);
-        if (!length_outcome || length_message.completion().io_status.Status != oc::core::status_success)
         {
-            return false;
-        }
+            constexpr ULONG api_size = sizeof(CONSOLE_GETCOMMANDHISTORYLENGTH_MSG);
+            constexpr ULONG read_offset = api_size + header_size;
 
-        if (length_message.packet().payload.user_defined.u.console_msg_l3.GetConsoleCommandHistoryLengthW.CommandHistoryLength != 0)
-        {
-            return false;
+            oc::condrv::IoPacket length_packet{};
+            length_packet.payload.user_defined = oc::condrv::UserDefinedPacket{};
+            length_packet.descriptor.identifier.LowPart = 210;
+            length_packet.descriptor.function = oc::condrv::console_io_user_defined;
+            length_packet.descriptor.process = info.process;
+            length_packet.descriptor.object = info.output;
+            length_packet.descriptor.input_size = read_offset + exe_bytes;
+            length_packet.descriptor.output_size = api_size;
+            length_packet.payload.user_defined.msg_header.ApiNumber = static_cast<ULONG>(ConsolepGetCommandHistoryLength);
+            length_packet.payload.user_defined.msg_header.ApiDescriptorSize = api_size;
+
+            auto& length_body = length_packet.payload.user_defined.u.console_msg_l3.GetConsoleCommandHistoryLengthW;
+            length_body.Unicode = TRUE;
+            length_body.CommandHistoryLength = 0;
+
+            comm.input.assign(length_packet.descriptor.input_size, std::byte{});
+            std::memcpy(comm.input.data() + read_offset, exe.data(), exe_bytes);
+
+            oc::condrv::BasicApiMessage<DummyComm> length_message(comm, length_packet);
+            auto length_outcome = oc::condrv::dispatch_message(state, length_message, host_io);
+            if (!length_outcome || length_message.completion().io_status.Status != oc::core::status_success)
+            {
+                return false;
+            }
+
+            if (length_message.packet().payload.user_defined.u.console_msg_l3.GetConsoleCommandHistoryLengthW.CommandHistoryLength != 0)
+            {
+                return false;
+            }
         }
 
         // Get history.
-        oc::condrv::IoPacket history_packet{};
-        history_packet.payload.user_defined = oc::condrv::UserDefinedPacket{};
-        history_packet.descriptor.identifier.LowPart = 211;
-        history_packet.descriptor.function = oc::condrv::console_io_user_defined;
-        history_packet.descriptor.process = info.process;
-        history_packet.descriptor.object = info.output;
-        history_packet.payload.user_defined.msg_header.ApiNumber = static_cast<ULONG>(ConsolepGetCommandHistory);
-        history_packet.payload.user_defined.msg_header.ApiDescriptorSize = sizeof(CONSOLE_GETCOMMANDHISTORY_MSG);
-
-        oc::condrv::BasicApiMessage<DummyComm> history_message(comm, history_packet);
-        auto history_outcome = oc::condrv::dispatch_message(state, history_message, host_io);
-        if (!history_outcome || history_message.completion().io_status.Status != oc::core::status_success)
         {
-            return false;
-        }
+            constexpr ULONG api_size = sizeof(CONSOLE_GETCOMMANDHISTORY_MSG);
+            constexpr ULONG read_offset = api_size + header_size;
 
-        if (history_message.packet().payload.user_defined.u.console_msg_l3.GetConsoleCommandHistoryW.CommandBufferLength != 0)
-        {
-            return false;
+            oc::condrv::IoPacket history_packet{};
+            history_packet.payload.user_defined = oc::condrv::UserDefinedPacket{};
+            history_packet.descriptor.identifier.LowPart = 211;
+            history_packet.descriptor.function = oc::condrv::console_io_user_defined;
+            history_packet.descriptor.process = info.process;
+            history_packet.descriptor.object = info.output;
+            history_packet.descriptor.input_size = read_offset + exe_bytes;
+            history_packet.descriptor.output_size = api_size + 64;
+            history_packet.payload.user_defined.msg_header.ApiNumber = static_cast<ULONG>(ConsolepGetCommandHistory);
+            history_packet.payload.user_defined.msg_header.ApiDescriptorSize = api_size;
+
+            auto& history_body = history_packet.payload.user_defined.u.console_msg_l3.GetConsoleCommandHistoryW;
+            history_body.Unicode = TRUE;
+            history_body.CommandBufferLength = 0;
+
+            comm.input.assign(history_packet.descriptor.input_size, std::byte{});
+            std::memcpy(comm.input.data() + read_offset, exe.data(), exe_bytes);
+
+            oc::condrv::BasicApiMessage<DummyComm> history_message(comm, history_packet);
+            auto history_outcome = oc::condrv::dispatch_message(state, history_message, host_io);
+            if (!history_outcome || history_message.completion().io_status.Status != oc::core::status_success)
+            {
+                return false;
+            }
+
+            if (history_message.packet().payload.user_defined.u.console_msg_l3.GetConsoleCommandHistoryW.CommandBufferLength != 0)
+            {
+                return false;
+            }
         }
 
         // Set number of commands.
-        oc::condrv::IoPacket set_packet{};
-        set_packet.payload.user_defined = oc::condrv::UserDefinedPacket{};
-        set_packet.descriptor.identifier.LowPart = 212;
-        set_packet.descriptor.function = oc::condrv::console_io_user_defined;
-        set_packet.descriptor.process = info.process;
-        set_packet.descriptor.object = info.output;
-        set_packet.payload.user_defined.msg_header.ApiNumber = static_cast<ULONG>(ConsolepSetNumberOfCommands);
-        set_packet.payload.user_defined.msg_header.ApiDescriptorSize = sizeof(CONSOLE_SETNUMBEROFCOMMANDS_MSG);
-
-        oc::condrv::BasicApiMessage<DummyComm> set_message(comm, set_packet);
-        auto set_outcome = oc::condrv::dispatch_message(state, set_message, host_io);
-        if (!set_outcome || set_message.completion().io_status.Status != oc::core::status_success)
         {
-            return false;
+            constexpr ULONG api_size = sizeof(CONSOLE_SETNUMBEROFCOMMANDS_MSG);
+            constexpr ULONG read_offset = api_size + header_size;
+
+            oc::condrv::IoPacket set_packet{};
+            set_packet.payload.user_defined = oc::condrv::UserDefinedPacket{};
+            set_packet.descriptor.identifier.LowPart = 212;
+            set_packet.descriptor.function = oc::condrv::console_io_user_defined;
+            set_packet.descriptor.process = info.process;
+            set_packet.descriptor.object = info.output;
+            set_packet.descriptor.input_size = read_offset + exe_bytes;
+            set_packet.descriptor.output_size = api_size;
+            set_packet.payload.user_defined.msg_header.ApiNumber = static_cast<ULONG>(ConsolepSetNumberOfCommands);
+            set_packet.payload.user_defined.msg_header.ApiDescriptorSize = api_size;
+
+            auto& set_body = set_packet.payload.user_defined.u.console_msg_l3.SetConsoleNumberOfCommandsW;
+            set_body.Unicode = TRUE;
+            set_body.NumCommands = 10;
+
+            comm.input.assign(set_packet.descriptor.input_size, std::byte{});
+            std::memcpy(comm.input.data() + read_offset, exe.data(), exe_bytes);
+
+            oc::condrv::BasicApiMessage<DummyComm> set_message(comm, set_packet);
+            auto set_outcome = oc::condrv::dispatch_message(state, set_message, host_io);
+            if (!set_outcome || set_message.completion().io_status.Status != oc::core::status_success)
+            {
+                return false;
+            }
         }
 
         // Expunge.
-        oc::condrv::IoPacket expunge_packet{};
-        expunge_packet.payload.user_defined = oc::condrv::UserDefinedPacket{};
-        expunge_packet.descriptor.identifier.LowPart = 213;
-        expunge_packet.descriptor.function = oc::condrv::console_io_user_defined;
-        expunge_packet.descriptor.process = info.process;
-        expunge_packet.descriptor.object = info.output;
-        expunge_packet.payload.user_defined.msg_header.ApiNumber = static_cast<ULONG>(ConsolepExpungeCommandHistory);
-        expunge_packet.payload.user_defined.msg_header.ApiDescriptorSize = sizeof(CONSOLE_EXPUNGECOMMANDHISTORY_MSG);
+        {
+            constexpr ULONG api_size = sizeof(CONSOLE_EXPUNGECOMMANDHISTORY_MSG);
+            constexpr ULONG read_offset = api_size + header_size;
 
-        oc::condrv::BasicApiMessage<DummyComm> expunge_message(comm, expunge_packet);
-        auto expunge_outcome = oc::condrv::dispatch_message(state, expunge_message, host_io);
-        return expunge_outcome && expunge_message.completion().io_status.Status == oc::core::status_success;
+            oc::condrv::IoPacket expunge_packet{};
+            expunge_packet.payload.user_defined = oc::condrv::UserDefinedPacket{};
+            expunge_packet.descriptor.identifier.LowPart = 213;
+            expunge_packet.descriptor.function = oc::condrv::console_io_user_defined;
+            expunge_packet.descriptor.process = info.process;
+            expunge_packet.descriptor.object = info.output;
+            expunge_packet.descriptor.input_size = read_offset + exe_bytes;
+            expunge_packet.descriptor.output_size = api_size;
+            expunge_packet.payload.user_defined.msg_header.ApiNumber = static_cast<ULONG>(ConsolepExpungeCommandHistory);
+            expunge_packet.payload.user_defined.msg_header.ApiDescriptorSize = api_size;
+
+            auto& expunge_body = expunge_packet.payload.user_defined.u.console_msg_l3.ExpungeConsoleCommandHistoryW;
+            expunge_body.Unicode = TRUE;
+
+            comm.input.assign(expunge_packet.descriptor.input_size, std::byte{});
+            std::memcpy(comm.input.data() + read_offset, exe.data(), exe_bytes);
+
+            oc::condrv::BasicApiMessage<DummyComm> expunge_message(comm, expunge_packet);
+            auto expunge_outcome = oc::condrv::dispatch_message(state, expunge_message, host_io);
+            return expunge_outcome && expunge_message.completion().io_status.Status == oc::core::status_success;
+        }
     }
 
     bool test_user_defined_screen_buffer_info_and_cursor_roundtrip()
@@ -2692,9 +2783,9 @@ bool run_condrv_server_dispatch_tests()
         fwprintf(stderr, L"[condrv dispatch] test_user_defined_get_set_history_round_trips failed\n");
         return false;
     }
-    if (!test_user_defined_command_history_apis_are_stubbed())
+    if (!test_user_defined_command_history_apis_succeed_with_empty_history())
     {
-        fwprintf(stderr, L"[condrv dispatch] test_user_defined_command_history_apis_are_stubbed failed\n");
+        fwprintf(stderr, L"[condrv dispatch] test_user_defined_command_history_apis_succeed_with_empty_history failed\n");
         return false;
     }
     if (!test_user_defined_screen_buffer_info_and_cursor_roundtrip())

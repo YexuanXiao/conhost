@@ -1,6 +1,7 @@
 #include "core/unique_handle.hpp"
 
 #include <Windows.h>
+#include <winternl.h>
 
 #include <algorithm>
 #include <array>
@@ -8,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <expected>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -15,6 +17,17 @@
 
 namespace
 {
+#ifndef ProcThreadAttributeConsoleReference
+    // Matches OpenConsole's legacy server startup (`src/server/winbasep.h`).
+    // This attribute is consumed by the kernel console runtime to associate the
+    // new process with a specific ConDrv server instance.
+#define ProcThreadAttributeConsoleReference 10
+#endif
+
+#ifndef PROC_THREAD_ATTRIBUTE_CONSOLE_REFERENCE
+#define PROC_THREAD_ATTRIBUTE_CONSOLE_REFERENCE ProcThreadAttributeValue(ProcThreadAttributeConsoleReference, FALSE, TRUE, FALSE)
+#endif
+
     [[nodiscard]] std::wstring module_path() noexcept
     {
         // Avoid MAX_PATH by growing the buffer until GetModuleFileNameW succeeds.
@@ -92,6 +105,54 @@ namespace
         }
 
         std::wstring candidate = join_path(build_dir, L"openconsole_new.exe");
+        const DWORD attrs = ::GetFileAttributesW(candidate.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES)
+        {
+            return std::nullopt;
+        }
+
+        return candidate;
+    }
+
+    [[nodiscard]] std::optional<std::wstring> locate_condrv_client_smoke() noexcept
+    {
+        const std::wstring exe = module_path();
+        if (exe.empty())
+        {
+            return std::nullopt;
+        }
+
+        const std::wstring test_dir = directory_name(exe);
+        if (test_dir.empty())
+        {
+            return std::nullopt;
+        }
+
+        std::wstring candidate = join_path(test_dir, L"oc_new_condrv_client_smoke.exe");
+        const DWORD attrs = ::GetFileAttributesW(candidate.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES)
+        {
+            return std::nullopt;
+        }
+
+        return candidate;
+    }
+
+    [[nodiscard]] std::optional<std::wstring> locate_condrv_client_input_events() noexcept
+    {
+        const std::wstring exe = module_path();
+        if (exe.empty())
+        {
+            return std::nullopt;
+        }
+
+        const std::wstring test_dir = directory_name(exe);
+        if (test_dir.empty())
+        {
+            return std::nullopt;
+        }
+
+        std::wstring candidate = join_path(test_dir, L"oc_new_condrv_client_input_events.exe");
         const DWORD attrs = ::GetFileAttributesW(candidate.c_str());
         if (attrs == INVALID_FILE_ATTRIBUTES)
         {
@@ -217,6 +278,287 @@ namespace
         std::wstring _name;
         std::optional<std::wstring> _previous;
     };
+
+    struct Ntdll final
+    {
+        using NtOpenFileFn = NTSTATUS(NTAPI*)(
+            PHANDLE file_handle,
+            ACCESS_MASK desired_access,
+            POBJECT_ATTRIBUTES object_attributes,
+            PIO_STATUS_BLOCK io_status_block,
+            ULONG share_access,
+            ULONG open_options);
+
+        using RtlNtStatusToDosErrorFn = ULONG(WINAPI*)(NTSTATUS status);
+
+        NtOpenFileFn nt_open_file{};
+        RtlNtStatusToDosErrorFn rtl_nt_status_to_dos_error{};
+    };
+
+    [[nodiscard]] std::optional<Ntdll> load_ntdll() noexcept
+    {
+        HMODULE module = ::GetModuleHandleW(L"ntdll.dll");
+        if (module == nullptr)
+        {
+            module = ::LoadLibraryW(L"ntdll.dll");
+        }
+
+        if (module == nullptr)
+        {
+            return std::nullopt;
+        }
+
+        auto* const nt_open_file = reinterpret_cast<Ntdll::NtOpenFileFn>(::GetProcAddress(module, "NtOpenFile"));
+        auto* const rtl_nt_status_to_dos_error = reinterpret_cast<Ntdll::RtlNtStatusToDosErrorFn>(::GetProcAddress(module, "RtlNtStatusToDosError"));
+        if (nt_open_file == nullptr || rtl_nt_status_to_dos_error == nullptr)
+        {
+            return std::nullopt;
+        }
+
+        return Ntdll{
+            .nt_open_file = nt_open_file,
+            .rtl_nt_status_to_dos_error = rtl_nt_status_to_dos_error,
+        };
+    }
+
+    [[nodiscard]] std::expected<oc::core::UniqueHandle, DWORD> nt_open_file(
+        const Ntdll& ntdll,
+        const std::wstring_view device_name,
+        const ACCESS_MASK desired_access,
+        const HANDLE parent,
+        const bool inheritable,
+        const ULONG open_options,
+        const bool verbose_failures) noexcept
+    {
+        if (device_name.size() > (std::numeric_limits<USHORT>::max() / sizeof(wchar_t)))
+        {
+            return std::unexpected(ERROR_FILENAME_EXCED_RANGE);
+        }
+
+        std::wstring name_storage(device_name);
+        name_storage.push_back(L'\0');
+
+        UNICODE_STRING name{};
+        name.Buffer = name_storage.data();
+        name.Length = static_cast<USHORT>(device_name.size() * sizeof(wchar_t));
+        name.MaximumLength = static_cast<USHORT>(name.Length + sizeof(wchar_t));
+
+        ULONG attributes = OBJ_CASE_INSENSITIVE;
+        if (inheritable)
+        {
+            attributes |= OBJ_INHERIT;
+        }
+
+        OBJECT_ATTRIBUTES object_attributes{};
+        InitializeObjectAttributes(
+            &object_attributes,
+            &name,
+            attributes,
+            parent,
+            nullptr);
+
+        IO_STATUS_BLOCK io_status{};
+        HANDLE handle = nullptr;
+        const NTSTATUS status = ntdll.nt_open_file(
+            &handle,
+            desired_access,
+            &object_attributes,
+            &io_status,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            open_options);
+        if (status < 0)
+        {
+            const DWORD error = static_cast<DWORD>(ntdll.rtl_nt_status_to_dos_error(status));
+            if (verbose_failures)
+            {
+                fwprintf(stderr,
+                         L"[DETAIL] NtOpenFile(%ls) failed (status=0x%08X win32=%lu)\n",
+                         name_storage.c_str(),
+                         static_cast<unsigned int>(status),
+                         error);
+            }
+            return std::unexpected(error == 0 ? ERROR_GEN_FAILURE : error);
+        }
+
+        return oc::core::UniqueHandle(handle);
+    }
+
+    struct ConDrvHandleBundle final
+    {
+        oc::core::UniqueHandle server;
+        oc::core::UniqueHandle reference;
+        oc::core::UniqueHandle input;
+        oc::core::UniqueHandle output;
+        oc::core::UniqueHandle error;
+    };
+
+    [[nodiscard]] std::expected<ConDrvHandleBundle, DWORD> create_condrv_handle_bundle(const Ntdll& ntdll) noexcept
+    {
+        constexpr ULONG kFileSynchronousIoNonAlert = 0x00000020;
+
+        ConDrvHandleBundle bundle{};
+        auto server = nt_open_file(ntdll, L"\\Device\\ConDrv\\Server", GENERIC_ALL, nullptr, true, 0, true);
+        if (!server)
+        {
+            return std::unexpected(server.error());
+        }
+        bundle.server = std::move(server.value());
+
+        auto reference = nt_open_file(ntdll, L"\\Reference", GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, bundle.server.get(), true, kFileSynchronousIoNonAlert, true);
+        if (!reference)
+        {
+            return std::unexpected(reference.error());
+        }
+        bundle.reference = std::move(reference.value());
+
+        return bundle;
+    }
+
+    [[nodiscard]] std::expected<void, DWORD> create_condrv_io_handles(const Ntdll& ntdll, ConDrvHandleBundle& bundle) noexcept
+    {
+        constexpr ULONG kFileSynchronousIoNonAlert = 0x00000020;
+
+        auto input = nt_open_file(ntdll, L"\\Input", GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, bundle.server.get(), true, kFileSynchronousIoNonAlert, false);
+        if (!input)
+        {
+            return std::unexpected(input.error());
+        }
+        bundle.input = std::move(input.value());
+
+        auto output = nt_open_file(ntdll, L"\\Output", GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, bundle.server.get(), true, kFileSynchronousIoNonAlert, false);
+        if (!output)
+        {
+            return std::unexpected(output.error());
+        }
+        bundle.output = std::move(output.value());
+
+        if (::DuplicateHandle(
+                ::GetCurrentProcess(),
+                bundle.output.get(),
+                ::GetCurrentProcess(),
+                bundle.error.put(),
+                0,
+                TRUE,
+                DUPLICATE_SAME_ACCESS) == FALSE)
+        {
+            return std::unexpected(::GetLastError());
+        }
+
+        return {};
+    }
+
+    struct ProcessInfo final
+    {
+        oc::core::UniqueHandle process;
+        oc::core::UniqueHandle thread;
+    };
+
+    [[nodiscard]] std::expected<ProcessInfo, DWORD> spawn_process_with_attributes(
+        const std::wstring& application,
+        std::wstring command_line,
+        const HANDLE stdin_handle,
+        const HANDLE stdout_handle,
+        const HANDLE stderr_handle,
+        const std::vector<HANDLE>& handles_to_inherit,
+        const HANDLE console_reference,
+        const DWORD creation_flags) noexcept
+    {
+        // Prepare mutable command line buffer.
+        std::vector<wchar_t> mutable_command_line;
+        mutable_command_line.reserve(command_line.size() + 1);
+        mutable_command_line.insert(mutable_command_line.end(), command_line.begin(), command_line.end());
+        mutable_command_line.push_back(L'\0');
+
+        const bool include_console_reference = console_reference != nullptr;
+        const DWORD attribute_count = include_console_reference ? 2 : 1;
+
+        SIZE_T attribute_list_size = 0;
+        (void)::InitializeProcThreadAttributeList(nullptr, attribute_count, 0, &attribute_list_size);
+        if (attribute_list_size == 0)
+        {
+            return std::unexpected(::GetLastError());
+        }
+
+        std::vector<std::byte> attribute_storage(attribute_list_size);
+        auto* const attribute_list = reinterpret_cast<PPROC_THREAD_ATTRIBUTE_LIST>(attribute_storage.data());
+        if (::InitializeProcThreadAttributeList(attribute_list, attribute_count, 0, &attribute_list_size) == FALSE)
+        {
+            return std::unexpected(::GetLastError());
+        }
+        struct AttributeCleanup final
+        {
+            PPROC_THREAD_ATTRIBUTE_LIST list{};
+            ~AttributeCleanup() noexcept
+            {
+                if (list != nullptr)
+                {
+                    ::DeleteProcThreadAttributeList(list);
+                }
+            }
+        } cleanup{ attribute_list };
+
+        if (include_console_reference)
+        {
+            HANDLE reference_value = console_reference;
+            if (::UpdateProcThreadAttribute(
+                    attribute_list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_CONSOLE_REFERENCE,
+                    &reference_value,
+                    sizeof(reference_value),
+                    nullptr,
+                    nullptr) == FALSE)
+            {
+                return std::unexpected(::GetLastError());
+            }
+        }
+
+        if (!handles_to_inherit.empty())
+        {
+            if (::UpdateProcThreadAttribute(
+                    attribute_list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                    const_cast<HANDLE*>(handles_to_inherit.data()),
+                    static_cast<DWORD>(handles_to_inherit.size() * sizeof(HANDLE)),
+                    nullptr,
+                    nullptr) == FALSE)
+            {
+                return std::unexpected(::GetLastError());
+            }
+        }
+
+        STARTUPINFOEXW startup{};
+        startup.StartupInfo.cb = sizeof(startup);
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = stdin_handle;
+        startup.StartupInfo.hStdOutput = stdout_handle;
+        startup.StartupInfo.hStdError = stderr_handle;
+        startup.lpAttributeList = attribute_list;
+
+        PROCESS_INFORMATION info{};
+        const DWORD flags = EXTENDED_STARTUPINFO_PRESENT | creation_flags;
+        const BOOL created = ::CreateProcessW(
+            application.c_str(),
+            mutable_command_line.data(),
+            nullptr,
+            nullptr,
+            TRUE,
+            flags,
+            nullptr,
+            nullptr,
+            &startup.StartupInfo,
+            &info);
+        if (created == FALSE)
+        {
+            return std::unexpected(::GetLastError());
+        }
+
+        return ProcessInfo{
+            .process = oc::core::UniqueHandle(info.hProcess),
+            .thread = oc::core::UniqueHandle(info.hThread),
+        };
+    }
 
     void dump_text_file_preview(std::wstring_view path) noexcept
     {
@@ -615,10 +957,682 @@ namespace
 
         return true;
     }
+
+    bool test_openconsole_new_headless_condrv_server_end_to_end_basic_io()
+    {
+        const auto openconsole_path = locate_openconsole_new();
+        if (!openconsole_path)
+        {
+            fwprintf(stderr, L"[DETAIL] openconsole_new.exe was not found relative to test binary\n");
+            return false;
+        }
+
+        const auto client_path = locate_condrv_client_smoke();
+        if (!client_path)
+        {
+            fwprintf(stderr, L"[DETAIL] oc_new_condrv_client_smoke.exe was not found relative to test binary\n");
+            return false;
+        }
+
+        const auto ntdll = load_ntdll();
+        if (!ntdll)
+        {
+            fwprintf(stderr, L"[DETAIL] ntdll native entrypoints were unavailable\n");
+            return false;
+        }
+
+        auto condrv_handles = create_condrv_handle_bundle(*ntdll);
+        if (!condrv_handles)
+        {
+            fwprintf(stderr, L"[DETAIL] failed to create ConDrv handle bundle (error=%lu)\n", condrv_handles.error());
+            return false;
+        }
+
+        auto stdout_pipe = create_pipe_inherit_write_end();
+        if (!stdout_pipe)
+        {
+            fwprintf(stderr, L"[DETAIL] failed to create stdout pipe (error=%lu)\n", stdout_pipe.error());
+            return false;
+        }
+
+        auto stdin_pipe = create_pipe_inherit_read_end();
+        if (!stdin_pipe)
+        {
+            fwprintf(stderr, L"[DETAIL] failed to create stdin pipe (error=%lu)\n", stdin_pipe.error());
+            return false;
+        }
+
+        const std::wstring application = *openconsole_path;
+        const std::wstring build_dir = directory_name(application);
+        const std::wstring log_path = join_path(build_dir, L"oc_new_condrv_process_integration.log");
+        (void)::DeleteFileW(log_path.c_str());
+        const ScopedEnvironmentVariable log_level(L"OPENCONSOLE_NEW_LOG_LEVEL", L"debug");
+        const ScopedEnvironmentVariable log_file(L"OPENCONSOLE_NEW_LOG_FILE", log_path);
+
+        const auto server_handle_value = static_cast<unsigned long long>(condrv_handles->server.view().as_uintptr());
+        wchar_t server_handle_text[32]{};
+        const int formatted = swprintf_s(server_handle_text, L"0x%llX", server_handle_value);
+        if (formatted <= 0)
+        {
+            fwprintf(stderr, L"[DETAIL] failed to format server handle value\n");
+            return false;
+        }
+
+        const std::wstring server_cmd =
+            quote(application) +
+            L" --server " +
+            server_handle_text +
+            L" --headless";
+
+        std::vector<HANDLE> server_handle_list;
+        server_handle_list.push_back(condrv_handles->server.get());
+        server_handle_list.push_back(stdin_pipe->read.get());
+        server_handle_list.push_back(stdout_pipe->write.get());
+
+        auto server_process = spawn_process_with_attributes(
+            application,
+            server_cmd,
+            stdin_pipe->read.get(),
+            stdout_pipe->write.get(),
+            stdout_pipe->write.get(),
+            server_handle_list,
+            nullptr,
+            CREATE_NO_WINDOW);
+        if (!server_process)
+        {
+            fwprintf(stderr, L"[DETAIL] failed to spawn server process (error=%lu)\n", server_process.error());
+            dump_text_file_preview(log_path);
+            return false;
+        }
+
+        // Close our copies of the ends that the server inherited.
+        stdout_pipe->write.reset();
+        stdin_pipe->read.reset();
+
+        // ConDrv rejects opening the default I/O objects until the server has
+        // registered and started its I/O loop. Wait briefly for it to become
+        // ready before creating the client handles.
+        const ULONGLONG io_start_tick = ::GetTickCount64();
+        for (;;)
+        {
+            auto created = create_condrv_io_handles(*ntdll, *condrv_handles);
+            if (created)
+            {
+                break;
+            }
+
+            if (created.error() != ERROR_BAD_COMMAND)
+            {
+                fwprintf(stderr, L"[DETAIL] failed to create ConDrv I/O handles (error=%lu)\n", created.error());
+                (void)::TerminateProcess(server_process->process.get(), 0xBADC0DE);
+                (void)::WaitForSingleObject(server_process->process.get(), 5'000);
+                dump_text_file_preview(log_path);
+                return false;
+            }
+
+            const ULONGLONG now = ::GetTickCount64();
+            if ((now - io_start_tick) >= 5'000)
+            {
+                fwprintf(stderr, L"[DETAIL] timed out waiting for ConDrv server readiness\n");
+                (void)::TerminateProcess(server_process->process.get(), 0xBADC0DE);
+                (void)::WaitForSingleObject(server_process->process.get(), 5'000);
+                dump_text_file_preview(log_path);
+                return false;
+            }
+
+            ::Sleep(10);
+        }
+
+        const std::wstring client_application = *client_path;
+        const std::wstring client_cmd = quote(client_application);
+
+        std::vector<HANDLE> client_handle_list;
+        client_handle_list.push_back(condrv_handles->input.get());
+        client_handle_list.push_back(condrv_handles->output.get());
+        client_handle_list.push_back(condrv_handles->error.get());
+        client_handle_list.push_back(condrv_handles->reference.get());
+
+        auto client_process = spawn_process_with_attributes(
+            client_application,
+            client_cmd,
+            condrv_handles->input.get(),
+            condrv_handles->output.get(),
+            condrv_handles->error.get(),
+            client_handle_list,
+            condrv_handles->reference.get(),
+            0);
+        if (!client_process)
+        {
+            fwprintf(stderr, L"[DETAIL] failed to spawn client process (error=%lu)\n", client_process.error());
+            (void)::TerminateProcess(server_process->process.get(), 0xBADC0DE);
+            (void)::WaitForSingleObject(server_process->process.get(), 5'000);
+            dump_text_file_preview(log_path);
+            return false;
+        }
+
+        // The client now owns its inherited handles; close our extra references so
+        // the driver can observe disconnect once the client exits.
+        condrv_handles->reference.reset();
+        condrv_handles->input.reset();
+        condrv_handles->output.reset();
+        condrv_handles->error.reset();
+
+        constexpr std::string_view input_bytes = "abc";
+        if (!input_bytes.empty())
+        {
+            DWORD total_written = 0;
+            const DWORD to_write = static_cast<DWORD>(input_bytes.size());
+            while (total_written < to_write)
+            {
+                DWORD written = 0;
+                if (::WriteFile(
+                        stdin_pipe->write.get(),
+                        input_bytes.data() + total_written,
+                        to_write - total_written,
+                        &written,
+                        nullptr) == FALSE)
+                {
+                    fwprintf(stderr, L"[DETAIL] failed to write host input (error=%lu)\n", ::GetLastError());
+                    (void)::TerminateProcess(client_process->process.get(), 0xBADC0DE);
+                    (void)::TerminateProcess(server_process->process.get(), 0xBADC0DE);
+                    (void)::WaitForSingleObject(client_process->process.get(), 5'000);
+                    (void)::WaitForSingleObject(server_process->process.get(), 5'000);
+                    dump_text_file_preview(log_path);
+                    return false;
+                }
+                total_written += written;
+            }
+        }
+
+        // Signal EOF on host input so the input monitor can terminate cleanly.
+        stdin_pipe->write.reset();
+
+        std::vector<std::byte> captured;
+        captured.reserve(4096);
+
+        const ULONGLONG start_tick = ::GetTickCount64();
+        bool client_exited = false;
+        bool server_exited = false;
+
+        for (;;)
+        {
+            // Drain any available server stdout output.
+            for (;;)
+            {
+                DWORD available = 0;
+                if (::PeekNamedPipe(stdout_pipe->read.get(), nullptr, 0, nullptr, &available, nullptr) == FALSE)
+                {
+                    break;
+                }
+                if (available == 0)
+                {
+                    break;
+                }
+
+                std::array<std::byte, 8192> buffer{};
+                const DWORD to_read = available < buffer.size() ? available : static_cast<DWORD>(buffer.size());
+                DWORD read = 0;
+                if (::ReadFile(stdout_pipe->read.get(), buffer.data(), to_read, &read, nullptr) == FALSE)
+                {
+                    break;
+                }
+                if (read == 0)
+                {
+                    break;
+                }
+
+                try
+                {
+                    captured.insert(captured.end(), buffer.begin(), buffer.begin() + static_cast<size_t>(read));
+                }
+                catch (...)
+                {
+                    fwprintf(stderr, L"[DETAIL] out of memory capturing server output\n");
+                    return false;
+                }
+            }
+
+            if (!client_exited)
+            {
+                const DWORD wait_result = ::WaitForSingleObject(client_process->process.get(), 0);
+                if (wait_result == WAIT_OBJECT_0)
+                {
+                    client_exited = true;
+                }
+                else if (wait_result != WAIT_TIMEOUT)
+                {
+                    fwprintf(stderr, L"[DETAIL] client WaitForSingleObject failed (wait=%lu error=%lu)\n", wait_result, ::GetLastError());
+                    return false;
+                }
+            }
+
+            if (!server_exited)
+            {
+                const DWORD wait_result = ::WaitForSingleObject(server_process->process.get(), 0);
+                if (wait_result == WAIT_OBJECT_0)
+                {
+                    server_exited = true;
+                }
+                else if (wait_result != WAIT_TIMEOUT)
+                {
+                    fwprintf(stderr, L"[DETAIL] server WaitForSingleObject failed (wait=%lu error=%lu)\n", wait_result, ::GetLastError());
+                    return false;
+                }
+            }
+
+            if (client_exited && server_exited)
+            {
+                DWORD available = 0;
+                if (::PeekNamedPipe(stdout_pipe->read.get(), nullptr, 0, nullptr, &available, nullptr) == FALSE || available == 0)
+                {
+                    break;
+                }
+
+                // Still have buffered output; drain it in the next iteration.
+                continue;
+            }
+
+            const DWORD wait_handles_count = (client_exited ? 0 : 1) + (server_exited ? 0 : 1);
+            if (wait_handles_count > 0)
+            {
+                HANDLE wait_handles[2]{};
+                DWORD wait_index = 0;
+                if (!client_exited)
+                {
+                    wait_handles[wait_index++] = client_process->process.get();
+                }
+                if (!server_exited)
+                {
+                    wait_handles[wait_index++] = server_process->process.get();
+                }
+
+                const DWORD wait_result = ::WaitForMultipleObjects(wait_handles_count, wait_handles, FALSE, 20);
+                if (wait_result == WAIT_FAILED)
+                {
+                    fwprintf(stderr, L"[DETAIL] WaitForMultipleObjects failed (error=%lu)\n", ::GetLastError());
+                    return false;
+                }
+            }
+
+            const ULONGLONG now = ::GetTickCount64();
+            if ((now - start_tick) >= 30'000)
+            {
+                fwprintf(stderr, L"[DETAIL] condrv integration timed out\n");
+                (void)::TerminateProcess(client_process->process.get(), 0xDEAD);
+                (void)::TerminateProcess(server_process->process.get(), 0xDEAD);
+                (void)::WaitForSingleObject(client_process->process.get(), 5'000);
+                (void)::WaitForSingleObject(server_process->process.get(), 5'000);
+                dump_bytes_preview(captured);
+                dump_text_file_preview(log_path);
+                return false;
+            }
+        }
+
+        DWORD client_exit_code = 0;
+        DWORD server_exit_code = 0;
+        if (::GetExitCodeProcess(client_process->process.get(), &client_exit_code) == FALSE ||
+            ::GetExitCodeProcess(server_process->process.get(), &server_exit_code) == FALSE)
+        {
+            fwprintf(stderr, L"[DETAIL] GetExitCodeProcess failed (error=%lu)\n", ::GetLastError());
+            return false;
+        }
+
+        if (client_exit_code != 0 || server_exit_code != 0)
+        {
+            fwprintf(stderr, L"[DETAIL] expected client/server exit codes 0/0, got %lu/%lu\n", client_exit_code, server_exit_code);
+            dump_bytes_preview(captured);
+            dump_text_file_preview(log_path);
+            return false;
+        }
+
+        if (!bytes_contain_ascii(captured, "HELLO") || !bytes_contain_ascii(captured, "XabcY"))
+        {
+            fwprintf(stderr, L"[DETAIL] did not observe expected condrv output tokens\n");
+            dump_bytes_preview(captured);
+            dump_text_file_preview(log_path);
+            return false;
+        }
+
+        return true;
+    }
+
+    bool test_openconsole_new_headless_condrv_server_end_to_end_input_events()
+    {
+        const auto openconsole_path = locate_openconsole_new();
+        if (!openconsole_path)
+        {
+            fwprintf(stderr, L"[DETAIL] openconsole_new.exe was not found relative to test binary\n");
+            return false;
+        }
+
+        const auto client_path = locate_condrv_client_input_events();
+        if (!client_path)
+        {
+            fwprintf(stderr, L"[DETAIL] oc_new_condrv_client_input_events.exe was not found relative to test binary\n");
+            return false;
+        }
+
+        const auto ntdll = load_ntdll();
+        if (!ntdll)
+        {
+            fwprintf(stderr, L"[DETAIL] ntdll native entrypoints were unavailable\n");
+            return false;
+        }
+
+        auto condrv_handles = create_condrv_handle_bundle(*ntdll);
+        if (!condrv_handles)
+        {
+            fwprintf(stderr, L"[DETAIL] failed to create ConDrv handle bundle (error=%lu)\n", condrv_handles.error());
+            return false;
+        }
+
+        auto stdout_pipe = create_pipe_inherit_write_end();
+        if (!stdout_pipe)
+        {
+            fwprintf(stderr, L"[DETAIL] failed to create stdout pipe (error=%lu)\n", stdout_pipe.error());
+            return false;
+        }
+
+        auto stdin_pipe = create_pipe_inherit_read_end();
+        if (!stdin_pipe)
+        {
+            fwprintf(stderr, L"[DETAIL] failed to create stdin pipe (error=%lu)\n", stdin_pipe.error());
+            return false;
+        }
+
+        const std::wstring application = *openconsole_path;
+        const std::wstring build_dir = directory_name(application);
+        const std::wstring log_path = join_path(build_dir, L"oc_new_condrv_process_integration_input_events.log");
+        (void)::DeleteFileW(log_path.c_str());
+        const ScopedEnvironmentVariable log_level(L"OPENCONSOLE_NEW_LOG_LEVEL", L"debug");
+        const ScopedEnvironmentVariable log_file(L"OPENCONSOLE_NEW_LOG_FILE", log_path);
+
+        const auto server_handle_value = static_cast<unsigned long long>(condrv_handles->server.view().as_uintptr());
+        wchar_t server_handle_text[32]{};
+        const int formatted = swprintf_s(server_handle_text, L"0x%llX", server_handle_value);
+        if (formatted <= 0)
+        {
+            fwprintf(stderr, L"[DETAIL] failed to format server handle value\n");
+            return false;
+        }
+
+        const std::wstring server_cmd =
+            quote(application) +
+            L" --server " +
+            server_handle_text +
+            L" --headless";
+
+        std::vector<HANDLE> server_handle_list;
+        server_handle_list.push_back(condrv_handles->server.get());
+        server_handle_list.push_back(stdin_pipe->read.get());
+        server_handle_list.push_back(stdout_pipe->write.get());
+
+        auto server_process = spawn_process_with_attributes(
+            application,
+            server_cmd,
+            stdin_pipe->read.get(),
+            stdout_pipe->write.get(),
+            stdout_pipe->write.get(),
+            server_handle_list,
+            nullptr,
+            CREATE_NO_WINDOW);
+        if (!server_process)
+        {
+            fwprintf(stderr, L"[DETAIL] failed to spawn server process (error=%lu)\n", server_process.error());
+            dump_text_file_preview(log_path);
+            return false;
+        }
+
+        stdout_pipe->write.reset();
+        stdin_pipe->read.reset();
+
+        const ULONGLONG io_start_tick = ::GetTickCount64();
+        for (;;)
+        {
+            auto created = create_condrv_io_handles(*ntdll, *condrv_handles);
+            if (created)
+            {
+                break;
+            }
+
+            if (created.error() != ERROR_BAD_COMMAND)
+            {
+                fwprintf(stderr, L"[DETAIL] failed to create ConDrv I/O handles (error=%lu)\n", created.error());
+                (void)::TerminateProcess(server_process->process.get(), 0xBADC0DE);
+                (void)::WaitForSingleObject(server_process->process.get(), 5'000);
+                dump_text_file_preview(log_path);
+                return false;
+            }
+
+            const ULONGLONG now = ::GetTickCount64();
+            if ((now - io_start_tick) >= 5'000)
+            {
+                fwprintf(stderr, L"[DETAIL] timed out waiting for ConDrv server readiness\n");
+                (void)::TerminateProcess(server_process->process.get(), 0xBADC0DE);
+                (void)::WaitForSingleObject(server_process->process.get(), 5'000);
+                dump_text_file_preview(log_path);
+                return false;
+            }
+
+            ::Sleep(10);
+        }
+
+        const std::wstring client_application = *client_path;
+        const std::wstring client_cmd = quote(client_application);
+
+        std::vector<HANDLE> client_handle_list;
+        client_handle_list.push_back(condrv_handles->input.get());
+        client_handle_list.push_back(condrv_handles->output.get());
+        client_handle_list.push_back(condrv_handles->error.get());
+        client_handle_list.push_back(condrv_handles->reference.get());
+
+        auto client_process = spawn_process_with_attributes(
+            client_application,
+            client_cmd,
+            condrv_handles->input.get(),
+            condrv_handles->output.get(),
+            condrv_handles->error.get(),
+            client_handle_list,
+            condrv_handles->reference.get(),
+            0);
+        if (!client_process)
+        {
+            fwprintf(stderr, L"[DETAIL] failed to spawn client process (error=%lu)\n", client_process.error());
+            (void)::TerminateProcess(server_process->process.get(), 0xBADC0DE);
+            (void)::WaitForSingleObject(server_process->process.get(), 5'000);
+            dump_text_file_preview(log_path);
+            return false;
+        }
+
+        condrv_handles->reference.reset();
+        condrv_handles->input.reset();
+        condrv_handles->output.reset();
+        condrv_handles->error.reset();
+
+        constexpr std::string_view input_bytes =
+            "\x1b[65;0;97;1;0;1_"  // 'a' keydown
+            "\x1b[38;0;0;1;0;1_";  // VK_UP keydown
+
+        if (!input_bytes.empty())
+        {
+            DWORD total_written = 0;
+            const DWORD to_write = static_cast<DWORD>(input_bytes.size());
+            while (total_written < to_write)
+            {
+                DWORD written = 0;
+                if (::WriteFile(
+                        stdin_pipe->write.get(),
+                        input_bytes.data() + total_written,
+                        to_write - total_written,
+                        &written,
+                        nullptr) == FALSE)
+                {
+                    fwprintf(stderr, L"[DETAIL] failed to write host input (error=%lu)\n", ::GetLastError());
+                    (void)::TerminateProcess(client_process->process.get(), 0xBADC0DE);
+                    (void)::TerminateProcess(server_process->process.get(), 0xBADC0DE);
+                    (void)::WaitForSingleObject(client_process->process.get(), 5'000);
+                    (void)::WaitForSingleObject(server_process->process.get(), 5'000);
+                    dump_text_file_preview(log_path);
+                    return false;
+                }
+                total_written += written;
+            }
+        }
+
+        stdin_pipe->write.reset();
+
+        std::vector<std::byte> captured;
+        captured.reserve(2048);
+
+        const ULONGLONG start_tick = ::GetTickCount64();
+        bool client_exited = false;
+        bool server_exited = false;
+
+        for (;;)
+        {
+            for (;;)
+            {
+                DWORD available = 0;
+                if (::PeekNamedPipe(stdout_pipe->read.get(), nullptr, 0, nullptr, &available, nullptr) == FALSE)
+                {
+                    break;
+                }
+                if (available == 0)
+                {
+                    break;
+                }
+
+                std::array<std::byte, 8192> buffer{};
+                const DWORD to_read = available < buffer.size() ? available : static_cast<DWORD>(buffer.size());
+                DWORD read = 0;
+                if (::ReadFile(stdout_pipe->read.get(), buffer.data(), to_read, &read, nullptr) == FALSE)
+                {
+                    break;
+                }
+                if (read == 0)
+                {
+                    break;
+                }
+
+                try
+                {
+                    captured.insert(captured.end(), buffer.begin(), buffer.begin() + static_cast<size_t>(read));
+                }
+                catch (...)
+                {
+                    fwprintf(stderr, L"[DETAIL] out of memory capturing server output\n");
+                    return false;
+                }
+            }
+
+            if (!client_exited)
+            {
+                const DWORD wait_result = ::WaitForSingleObject(client_process->process.get(), 0);
+                if (wait_result == WAIT_OBJECT_0)
+                {
+                    client_exited = true;
+                }
+                else if (wait_result != WAIT_TIMEOUT)
+                {
+                    fwprintf(stderr, L"[DETAIL] client WaitForSingleObject failed (wait=%lu error=%lu)\n", wait_result, ::GetLastError());
+                    return false;
+                }
+            }
+
+            if (!server_exited)
+            {
+                const DWORD wait_result = ::WaitForSingleObject(server_process->process.get(), 0);
+                if (wait_result == WAIT_OBJECT_0)
+                {
+                    server_exited = true;
+                }
+                else if (wait_result != WAIT_TIMEOUT)
+                {
+                    fwprintf(stderr, L"[DETAIL] server WaitForSingleObject failed (wait=%lu error=%lu)\n", wait_result, ::GetLastError());
+                    return false;
+                }
+            }
+
+            if (client_exited && server_exited)
+            {
+                DWORD available = 0;
+                if (::PeekNamedPipe(stdout_pipe->read.get(), nullptr, 0, nullptr, &available, nullptr) == FALSE || available == 0)
+                {
+                    break;
+                }
+
+                continue;
+            }
+
+            const DWORD wait_handles_count = (client_exited ? 0 : 1) + (server_exited ? 0 : 1);
+            if (wait_handles_count > 0)
+            {
+                HANDLE wait_handles[2]{};
+                DWORD wait_index = 0;
+                if (!client_exited)
+                {
+                    wait_handles[wait_index++] = client_process->process.get();
+                }
+                if (!server_exited)
+                {
+                    wait_handles[wait_index++] = server_process->process.get();
+                }
+
+                const DWORD wait_result = ::WaitForMultipleObjects(wait_handles_count, wait_handles, FALSE, 20);
+                if (wait_result == WAIT_FAILED)
+                {
+                    fwprintf(stderr, L"[DETAIL] WaitForMultipleObjects failed (error=%lu)\n", ::GetLastError());
+                    return false;
+                }
+            }
+
+            const ULONGLONG now = ::GetTickCount64();
+            if ((now - start_tick) >= 30'000)
+            {
+                fwprintf(stderr, L"[DETAIL] condrv input-events integration timed out\n");
+                (void)::TerminateProcess(client_process->process.get(), 0xDEAD);
+                (void)::TerminateProcess(server_process->process.get(), 0xDEAD);
+                (void)::WaitForSingleObject(client_process->process.get(), 5'000);
+                (void)::WaitForSingleObject(server_process->process.get(), 5'000);
+                dump_bytes_preview(captured);
+                dump_text_file_preview(log_path);
+                return false;
+            }
+        }
+
+        DWORD client_exit_code = 0;
+        DWORD server_exit_code = 0;
+        if (::GetExitCodeProcess(client_process->process.get(), &client_exit_code) == FALSE ||
+            ::GetExitCodeProcess(server_process->process.get(), &server_exit_code) == FALSE)
+        {
+            fwprintf(stderr, L"[DETAIL] GetExitCodeProcess failed (error=%lu)\n", ::GetLastError());
+            return false;
+        }
+
+        if (client_exit_code != 0 || server_exit_code != 0)
+        {
+            fwprintf(stderr, L"[DETAIL] expected client/server exit codes 0/0, got %lu/%lu\n", client_exit_code, server_exit_code);
+            dump_bytes_preview(captured);
+            dump_text_file_preview(log_path);
+            return false;
+        }
+
+        if (!bytes_contain_ascii(captured, "INPUTOK"))
+        {
+            fwprintf(stderr, L"[DETAIL] did not observe expected condrv input-events token\n");
+            dump_bytes_preview(captured);
+            dump_text_file_preview(log_path);
+            return false;
+        }
+
+        return true;
+    }
 }
 
 bool run_process_integration_tests()
 {
     return test_openconsole_new_headless_conpty_emits_output_and_exit_code() &&
-           test_openconsole_new_pipe_input_reaches_client();
+           test_openconsole_new_pipe_input_reaches_client() &&
+           test_openconsole_new_headless_condrv_server_end_to_end_basic_io() &&
+           test_openconsole_new_headless_condrv_server_end_to_end_input_events();
 }

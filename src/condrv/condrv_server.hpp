@@ -22,6 +22,7 @@
 
 #include "condrv/condrv_api_message.hpp"
 #include "condrv/condrv_device_comm.hpp"
+#include "condrv/command_history.hpp"
 #include "condrv/screen_buffer_snapshot.hpp"
 #include "condrv/vt_input_decoder.hpp"
 #include "core/assert.hpp"
@@ -577,7 +578,10 @@ namespace oc::logging
 
         [[nodiscard]] size_t process_count() const noexcept;
 
-        [[nodiscard]] std::expected<ConnectionInformation, DeviceCommError> connect_client(DWORD pid, DWORD tid) noexcept;
+        [[nodiscard]] std::expected<ConnectionInformation, DeviceCommError> connect_client(
+            DWORD pid,
+            DWORD tid,
+            std::wstring_view app_name = {}) noexcept;
         [[nodiscard]] bool disconnect_client(ULONG_PTR process_handle) noexcept;
 
         [[nodiscard]] std::expected<ULONG_PTR, DeviceCommError> create_object(ObjectHandle object) noexcept;
@@ -621,6 +625,14 @@ namespace oc::logging
         [[nodiscard]] ULONG history_buffer_count() const noexcept;
         [[nodiscard]] ULONG history_flags() const noexcept;
         void set_history_info(ULONG buffer_size, ULONG buffer_count, ULONG flags) noexcept;
+
+        [[nodiscard]] CommandHistory* try_command_history_for_process(ULONG_PTR process_handle) noexcept;
+        [[nodiscard]] CommandHistory* try_command_history_for_exe(std::wstring_view exe_name) noexcept;
+        [[nodiscard]] const CommandHistory* try_command_history_for_exe(std::wstring_view exe_name) const noexcept;
+
+        void add_command_history_for_process(ULONG_PTR process_handle, std::wstring_view command, bool suppress_duplicates) noexcept;
+        void expunge_command_history(std::wstring_view exe_name) noexcept;
+        void set_command_history_number_of_commands(std::wstring_view exe_name, size_t max_commands) noexcept;
 
         [[nodiscard]] ULONG font_index() const noexcept;
         [[nodiscard]] COORD font_size() const noexcept;
@@ -700,6 +712,7 @@ namespace oc::logging
         ULONG _history_buffer_size{ 50 };
         ULONG _history_buffer_count{ 4 };
         ULONG _history_flags{ 0 };
+        CommandHistoryPool _command_histories{};
 
         ULONG _font_index{ 0 };
         COORD _font_size{};
@@ -6008,6 +6021,34 @@ namespace oc::logging
 
             if (api_number == static_cast<ULONG>(ConsolepExpungeCommandHistory))
             {
+                auto input = message.get_input_buffer();
+                if (!input)
+                {
+                    return std::unexpected(input.error());
+                }
+
+                const auto& body = packet.payload.user_defined.u.console_msg_l3.ExpungeConsoleCommandHistoryW;
+                const bool unicode = body.Unicode != FALSE;
+                const UINT code_page = static_cast<UINT>(state.output_code_page());
+
+                auto exe_decoded = decode_console_string(
+                    unicode,
+                    std::span<const std::byte>(input->data(), input->size()),
+                    code_page,
+                    L"ConsolepExpungeCommandHistory exe name decode failed");
+                if (!exe_decoded)
+                {
+                    message.set_reply_status(exe_decoded.error().win32_error == ERROR_OUTOFMEMORY ? core::status_no_memory : core::status_invalid_parameter);
+                    message.set_reply_information(0);
+                    return outcome;
+                }
+
+                while (!exe_decoded->empty() && exe_decoded->back() == L'\0')
+                {
+                    exe_decoded->pop_back();
+                }
+
+                state.expunge_command_history(*exe_decoded);
                 message.set_reply_status(core::status_success);
                 message.set_reply_information(0);
                 return outcome;
@@ -6015,6 +6056,34 @@ namespace oc::logging
 
             if (api_number == static_cast<ULONG>(ConsolepSetNumberOfCommands))
             {
+                auto input = message.get_input_buffer();
+                if (!input)
+                {
+                    return std::unexpected(input.error());
+                }
+
+                const auto& body = packet.payload.user_defined.u.console_msg_l3.SetConsoleNumberOfCommandsW;
+                const bool unicode = body.Unicode != FALSE;
+                const UINT code_page = static_cast<UINT>(state.output_code_page());
+
+                auto exe_decoded = decode_console_string(
+                    unicode,
+                    std::span<const std::byte>(input->data(), input->size()),
+                    code_page,
+                    L"ConsolepSetNumberOfCommands exe name decode failed");
+                if (!exe_decoded)
+                {
+                    message.set_reply_status(exe_decoded.error().win32_error == ERROR_OUTOFMEMORY ? core::status_no_memory : core::status_invalid_parameter);
+                    message.set_reply_information(0);
+                    return outcome;
+                }
+
+                while (!exe_decoded->empty() && exe_decoded->back() == L'\0')
+                {
+                    exe_decoded->pop_back();
+                }
+
+                state.set_command_history_number_of_commands(*exe_decoded, static_cast<size_t>(body.NumCommands));
                 message.set_reply_status(core::status_success);
                 message.set_reply_information(0);
                 return outcome;
@@ -6022,7 +6091,89 @@ namespace oc::logging
 
             if (api_number == static_cast<ULONG>(ConsolepGetCommandHistoryLength))
             {
-                packet.payload.user_defined.u.console_msg_l3.GetConsoleCommandHistoryLengthW.CommandHistoryLength = 0;
+                auto input = message.get_input_buffer();
+                if (!input)
+                {
+                    return std::unexpected(input.error());
+                }
+
+                auto& body = packet.payload.user_defined.u.console_msg_l3.GetConsoleCommandHistoryLengthW;
+                const bool unicode = body.Unicode != FALSE;
+                const UINT code_page = static_cast<UINT>(state.output_code_page());
+
+                auto exe_decoded = decode_console_string(
+                    unicode,
+                    std::span<const std::byte>(input->data(), input->size()),
+                    code_page,
+                    L"ConsolepGetCommandHistoryLength exe name decode failed");
+                if (!exe_decoded)
+                {
+                    message.set_reply_status(exe_decoded.error().win32_error == ERROR_OUTOFMEMORY ? core::status_no_memory : core::status_invalid_parameter);
+                    message.set_reply_information(0);
+                    return outcome;
+                }
+
+                while (!exe_decoded->empty() && exe_decoded->back() == L'\0')
+                {
+                    exe_decoded->pop_back();
+                }
+
+                size_t length_bytes = 0;
+                if (const auto* history = state.try_command_history_for_exe(*exe_decoded))
+                {
+                    for (const auto& command : history->commands())
+                    {
+                        size_t entry_bytes = 0;
+                        if (unicode)
+                        {
+                            const size_t units = command.size() + 1;
+                            if (units > (std::numeric_limits<size_t>::max() / sizeof(wchar_t)))
+                            {
+                                message.set_reply_status(core::status_invalid_parameter);
+                                message.set_reply_information(0);
+                                return outcome;
+                            }
+                            entry_bytes = units * sizeof(wchar_t);
+                        }
+                        else
+                        {
+                            const int required = ::WideCharToMultiByte(
+                                code_page,
+                                0,
+                                command.data(),
+                                static_cast<int>(command.size()),
+                                nullptr,
+                                0,
+                                nullptr,
+                                nullptr);
+                            if (required <= 0)
+                            {
+                                message.set_reply_status(core::status_invalid_parameter);
+                                message.set_reply_information(0);
+                                return outcome;
+                            }
+
+                            entry_bytes = static_cast<size_t>(required) + 1;
+                        }
+
+                        if (length_bytes > std::numeric_limits<size_t>::max() - entry_bytes)
+                        {
+                            message.set_reply_status(core::status_invalid_parameter);
+                            message.set_reply_information(0);
+                            return outcome;
+                        }
+                        length_bytes += entry_bytes;
+                    }
+                }
+
+                if (length_bytes > static_cast<size_t>(std::numeric_limits<ULONG>::max()))
+                {
+                    message.set_reply_status(core::status_invalid_parameter);
+                    message.set_reply_information(0);
+                    return outcome;
+                }
+
+                body.CommandHistoryLength = static_cast<ULONG>(length_bytes);
                 message.set_reply_status(core::status_success);
                 message.set_reply_information(0);
                 return outcome;
@@ -6030,10 +6181,147 @@ namespace oc::logging
 
             if (api_number == static_cast<ULONG>(ConsolepGetCommandHistory))
             {
+                auto input = message.get_input_buffer();
+                if (!input)
+                {
+                    return std::unexpected(input.error());
+                }
+
+                auto output = message.get_output_buffer();
+                if (!output)
+                {
+                    return std::unexpected(output.error());
+                }
+
                 auto& body = packet.payload.user_defined.u.console_msg_l3.GetConsoleCommandHistoryW;
-                body.CommandBufferLength = 0;
+                const bool unicode = body.Unicode != FALSE;
+                const UINT code_page = static_cast<UINT>(state.output_code_page());
+
+                auto exe_decoded = decode_console_string(
+                    unicode,
+                    std::span<const std::byte>(input->data(), input->size()),
+                    code_page,
+                    L"ConsolepGetCommandHistory exe name decode failed");
+                if (!exe_decoded)
+                {
+                    message.set_reply_status(exe_decoded.error().win32_error == ERROR_OUTOFMEMORY ? core::status_no_memory : core::status_invalid_parameter);
+                    message.set_reply_information(0);
+                    return outcome;
+                }
+
+                while (!exe_decoded->empty() && exe_decoded->back() == L'\0')
+                {
+                    exe_decoded->pop_back();
+                }
+
+                const auto* history = state.try_command_history_for_exe(*exe_decoded);
+
+                size_t bytes_written = 0;
+                if (unicode)
+                {
+                    if ((output->size() % sizeof(wchar_t)) != 0)
+                    {
+                        message.set_reply_status(core::status_invalid_parameter);
+                        message.set_reply_information(0);
+                        return outcome;
+                    }
+
+                    auto* dest = reinterpret_cast<wchar_t*>(output->data());
+                    const size_t capacity_units = output->size() / sizeof(wchar_t);
+                    size_t written_units = 0;
+
+                    if (history != nullptr)
+                    {
+                        for (const auto& command : history->commands())
+                        {
+                            const size_t needed = command.size() + 1;
+                            if (written_units + needed > capacity_units)
+                            {
+                                message.set_reply_status(core::status_buffer_too_small);
+                                message.set_reply_information(0);
+                                return outcome;
+                            }
+
+                            if (!command.empty())
+                            {
+                                std::memcpy(dest + written_units, command.data(), command.size() * sizeof(wchar_t));
+                            }
+                            dest[written_units + command.size()] = L'\0';
+                            written_units += needed;
+                        }
+                    }
+
+                    bytes_written = written_units * sizeof(wchar_t);
+                }
+                else
+                {
+                    auto* dest = reinterpret_cast<char*>(output->data());
+                    const size_t capacity = output->size();
+
+                    if (history != nullptr)
+                    {
+                        for (const auto& command : history->commands())
+                        {
+                            const int required = ::WideCharToMultiByte(
+                                code_page,
+                                0,
+                                command.data(),
+                                static_cast<int>(command.size()),
+                                nullptr,
+                                0,
+                                nullptr,
+                                nullptr);
+                            if (required <= 0)
+                            {
+                                message.set_reply_status(core::status_invalid_parameter);
+                                message.set_reply_information(0);
+                                return outcome;
+                            }
+
+                            const size_t bytes_required = static_cast<size_t>(required);
+                            const size_t needed = bytes_required + 1;
+                            if (bytes_written + needed > capacity)
+                            {
+                                message.set_reply_status(core::status_buffer_too_small);
+                                message.set_reply_information(0);
+                                return outcome;
+                            }
+
+                            if (bytes_required != 0)
+                            {
+                                const int converted = ::WideCharToMultiByte(
+                                    code_page,
+                                    0,
+                                    command.data(),
+                                    static_cast<int>(command.size()),
+                                    dest + bytes_written,
+                                    required,
+                                    nullptr,
+                                    nullptr);
+                                if (converted != required)
+                                {
+                                    message.set_reply_status(core::status_invalid_parameter);
+                                    message.set_reply_information(0);
+                                    return outcome;
+                                }
+                            }
+
+                            dest[bytes_written + bytes_required] = '\0';
+                            bytes_written += needed;
+                        }
+                    }
+                }
+
+                if (bytes_written > static_cast<size_t>(std::numeric_limits<ULONG>::max()))
+                {
+                    message.set_reply_status(core::status_invalid_parameter);
+                    message.set_reply_information(0);
+                    return outcome;
+                }
+
+                body.CommandBufferLength = static_cast<ULONG>(bytes_written);
                 message.set_reply_status(core::status_success);
-                message.set_reply_information(0);
+                message.set_reply_information(body.CommandBufferLength);
                 return outcome;
             }
 
@@ -7297,6 +7585,12 @@ namespace oc::logging
                                     return std::unexpected(echoed.error());
                                 }
 
+                                if (echo_input)
+                                {
+                                    const bool suppress_duplicates = (state.history_flags() & HISTORY_NO_DUP_FLAG) != 0;
+                                    state.add_command_history_for_process(handle->owning_process, std::wstring_view(line), suppress_duplicates);
+                                }
+
                                 try
                                 {
                                     line.append(newline_suffix);
@@ -8441,7 +8735,34 @@ namespace oc::logging
             const DWORD pid = pid64 > 0xFFFF'FFFFULL ? 0 : static_cast<DWORD>(pid64);
             const DWORD tid = tid64 > 0xFFFF'FFFFULL ? 0 : static_cast<DWORD>(tid64);
 
-            auto info = state.connect_client(pid, tid);
+            // CONNECT input contains a `CONSOLE_SERVER_MSG` payload. We only use the application name
+            // for command history allocation; other fields are currently ignored.
+            std::wstring_view app_name{};
+            if (auto input = message.get_input_buffer())
+            {
+                if (input->size() >= sizeof(CONSOLE_SERVER_MSG))
+                {
+                    CONSOLE_SERVER_MSG data{};
+                    std::memcpy(&data, input->data(), sizeof(data));
+
+                    const size_t bytes = static_cast<size_t>(data.ApplicationNameLength);
+                    const bool aligned = (bytes % sizeof(wchar_t)) == 0;
+                    const bool within_buffer = bytes <= (sizeof(data.ApplicationName) - sizeof(wchar_t));
+                    const size_t cch = aligned ? (bytes / sizeof(wchar_t)) : 0;
+                    const bool has_terminator = aligned && cch < std::size(data.ApplicationName) && data.ApplicationName[cch] == L'\0';
+
+                    if (aligned && within_buffer && has_terminator)
+                    {
+                        app_name = std::wstring_view(data.ApplicationName, cch);
+                    }
+                }
+            }
+            else
+            {
+                return std::unexpected(input.error());
+            }
+
+            auto info = state.connect_client(pid, tid, app_name);
             if (!info)
             {
                 message.set_reply_status(core::status_no_memory);

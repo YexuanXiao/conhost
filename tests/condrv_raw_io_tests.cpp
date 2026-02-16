@@ -9369,6 +9369,429 @@ namespace
         }
     }
 
+    [[nodiscard]] oc::condrv::ConnectionInformation connect_with_app_name(
+        MemoryComm& comm,
+        oc::condrv::ServerState& state,
+        TestHostIo& host_io,
+        const DWORD pid,
+        const DWORD tid,
+        const std::wstring_view app_name,
+        const ULONG identifier) noexcept
+    {
+        auto packet = make_connect_packet(pid, tid);
+        packet.descriptor.identifier.LowPart = identifier;
+        packet.descriptor.input_size = sizeof(CONSOLE_SERVER_MSG);
+
+        CONSOLE_SERVER_MSG msg{};
+        const size_t bytes = app_name.size() * sizeof(wchar_t);
+        msg.ApplicationNameLength = bytes > std::numeric_limits<USHORT>::max()
+            ? std::numeric_limits<USHORT>::max()
+            : static_cast<USHORT>(bytes);
+
+        const size_t cch = msg.ApplicationNameLength / sizeof(wchar_t);
+        const size_t to_copy = std::min(cch, std::size(msg.ApplicationName) - 1);
+        if (to_copy != 0)
+        {
+            std::memcpy(msg.ApplicationName, app_name.data(), to_copy * sizeof(wchar_t));
+        }
+        msg.ApplicationName[to_copy] = L'\0';
+
+        comm.input.assign(packet.descriptor.input_size, std::byte{});
+        std::memcpy(comm.input.data(), &msg, sizeof(msg));
+
+        oc::condrv::BasicApiMessage<MemoryComm> connect_message(comm, packet);
+        const auto outcome = oc::condrv::dispatch_message(state, connect_message, host_io);
+        if (!outcome ||
+            connect_message.completion().io_status.Status != oc::core::status_success ||
+            connect_message.completion().write.data == nullptr ||
+            connect_message.completion().write.size != sizeof(oc::condrv::ConnectionInformation))
+        {
+            return {};
+        }
+        return unpack_connection_information(connect_message.completion());
+    }
+
+    [[nodiscard]] bool cooked_read_console_w(
+        MemoryComm& comm,
+        oc::condrv::ServerState& state,
+        TestHostIo& host_io,
+        const oc::condrv::ConnectionInformation info,
+        const std::span<const std::byte> input_bytes,
+        const ULONG identifier) noexcept
+    {
+        state.set_input_mode(ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+
+        host_io.input.assign(input_bytes.begin(), input_bytes.end());
+        host_io.input_offset = 0;
+        host_io.written.clear();
+
+        constexpr ULONG api_size = sizeof(CONSOLE_READCONSOLE_MSG);
+        constexpr ULONG header_size = sizeof(CONSOLE_MSG_HEADER);
+        constexpr ULONG read_offset = api_size + header_size;
+
+        oc::condrv::IoPacket packet{};
+        packet.payload.user_defined = oc::condrv::UserDefinedPacket{};
+        packet.descriptor.identifier.LowPart = identifier;
+        packet.descriptor.function = oc::condrv::console_io_user_defined;
+        packet.descriptor.process = info.process;
+        packet.descriptor.object = info.input;
+        packet.descriptor.input_size = read_offset;
+        packet.descriptor.output_size = api_size + 256;
+        packet.payload.user_defined.msg_header.ApiNumber = static_cast<ULONG>(ConsolepReadConsole);
+        packet.payload.user_defined.msg_header.ApiDescriptorSize = api_size;
+
+        auto& body = packet.payload.user_defined.u.console_msg_l1.ReadConsole;
+        body.Unicode = TRUE;
+        body.ProcessControlZ = FALSE;
+
+        oc::condrv::BasicApiMessage<MemoryComm> message(comm, packet);
+        const auto outcome = oc::condrv::dispatch_message(state, message, host_io);
+        if (!outcome || message.completion().io_status.Status != oc::core::status_success)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    [[nodiscard]] bool get_command_history_length_w(
+        MemoryComm& comm,
+        oc::condrv::ServerState& state,
+        TestHostIo& host_io,
+        const oc::condrv::ConnectionInformation info,
+        const std::wstring_view exe_name,
+        ULONG& length_bytes,
+        const ULONG identifier) noexcept
+    {
+        constexpr ULONG api_size = sizeof(CONSOLE_GETCOMMANDHISTORYLENGTH_MSG);
+        constexpr ULONG header_size = sizeof(CONSOLE_MSG_HEADER);
+        constexpr ULONG read_offset = api_size + header_size;
+
+        const ULONG exe_bytes = static_cast<ULONG>(exe_name.size() * sizeof(wchar_t));
+
+        oc::condrv::IoPacket packet{};
+        packet.payload.user_defined = oc::condrv::UserDefinedPacket{};
+        packet.descriptor.identifier.LowPart = identifier;
+        packet.descriptor.function = oc::condrv::console_io_user_defined;
+        packet.descriptor.process = info.process;
+        packet.descriptor.object = info.output;
+        packet.descriptor.input_size = read_offset + exe_bytes;
+        packet.descriptor.output_size = api_size;
+        packet.payload.user_defined.msg_header.ApiNumber = static_cast<ULONG>(ConsolepGetCommandHistoryLength);
+        packet.payload.user_defined.msg_header.ApiDescriptorSize = api_size;
+
+        auto& body = packet.payload.user_defined.u.console_msg_l3.GetConsoleCommandHistoryLengthW;
+        body.Unicode = TRUE;
+        body.CommandHistoryLength = 0;
+
+        comm.input.assign(packet.descriptor.input_size, std::byte{});
+        if (exe_bytes != 0)
+        {
+            std::memcpy(comm.input.data() + read_offset, exe_name.data(), exe_bytes);
+        }
+
+        oc::condrv::BasicApiMessage<MemoryComm> message(comm, packet);
+        const auto outcome = oc::condrv::dispatch_message(state, message, host_io);
+        if (!outcome || message.completion().io_status.Status != oc::core::status_success)
+        {
+            return false;
+        }
+
+        length_bytes = message.packet().payload.user_defined.u.console_msg_l3.GetConsoleCommandHistoryLengthW.CommandHistoryLength;
+        return true;
+    }
+
+    [[nodiscard]] bool get_command_history_w(
+        MemoryComm& comm,
+        oc::condrv::ServerState& state,
+        TestHostIo& host_io,
+        const oc::condrv::ConnectionInformation info,
+        const std::wstring_view exe_name,
+        std::wstring& out,
+        const ULONG identifier) noexcept
+    {
+        constexpr ULONG api_size = sizeof(CONSOLE_GETCOMMANDHISTORY_MSG);
+        constexpr ULONG header_size = sizeof(CONSOLE_MSG_HEADER);
+        constexpr ULONG read_offset = api_size + header_size;
+        constexpr ULONG output_capacity = 256;
+
+        const ULONG exe_bytes = static_cast<ULONG>(exe_name.size() * sizeof(wchar_t));
+
+        oc::condrv::IoPacket packet{};
+        packet.payload.user_defined = oc::condrv::UserDefinedPacket{};
+        packet.descriptor.identifier.LowPart = identifier;
+        packet.descriptor.function = oc::condrv::console_io_user_defined;
+        packet.descriptor.process = info.process;
+        packet.descriptor.object = info.output;
+        packet.descriptor.input_size = read_offset + exe_bytes;
+        packet.descriptor.output_size = api_size + output_capacity;
+        packet.payload.user_defined.msg_header.ApiNumber = static_cast<ULONG>(ConsolepGetCommandHistory);
+        packet.payload.user_defined.msg_header.ApiDescriptorSize = api_size;
+
+        auto& body = packet.payload.user_defined.u.console_msg_l3.GetConsoleCommandHistoryW;
+        body.Unicode = TRUE;
+        body.CommandBufferLength = 0;
+
+        comm.input.assign(packet.descriptor.input_size, std::byte{});
+        if (exe_bytes != 0)
+        {
+            std::memcpy(comm.input.data() + read_offset, exe_name.data(), exe_bytes);
+        }
+        comm.output.clear();
+
+        oc::condrv::BasicApiMessage<MemoryComm> message(comm, packet);
+        const auto outcome = oc::condrv::dispatch_message(state, message, host_io);
+        if (!outcome || message.completion().io_status.Status != oc::core::status_success)
+        {
+            return false;
+        }
+
+        if (auto released = message.release_message_buffers(); !released)
+        {
+            return false;
+        }
+
+        const size_t bytes_written =
+            message.packet().payload.user_defined.u.console_msg_l3.GetConsoleCommandHistoryW.CommandBufferLength;
+        if ((bytes_written % sizeof(wchar_t)) != 0)
+        {
+            return false;
+        }
+
+        const size_t units = bytes_written / sizeof(wchar_t);
+        out.assign(units, L'\0');
+        if (bytes_written != 0)
+        {
+            std::memcpy(out.data(), comm.output.data() + api_size, bytes_written);
+        }
+
+        return true;
+    }
+
+    bool test_command_history_records_cooked_read_and_is_queryable()
+    {
+        MemoryComm comm{};
+        oc::condrv::ServerState state{};
+        TestHostIo host_io{};
+
+        constexpr std::wstring_view exe = L"cmd.exe";
+        const auto info = connect_with_app_name(comm, state, host_io, 25001, 25002, exe, 250);
+        auto* history_for_process = state.try_command_history_for_process(info.process);
+        if (history_for_process == nullptr)
+        {
+            return false;
+        }
+
+        if (history_for_process->app_name() != exe)
+        {
+            return false;
+        }
+
+        static constexpr std::byte input_bytes[] = {
+            std::byte{ 'a' },
+            std::byte{ 'b' },
+            std::byte{ 'c' },
+            std::byte{ '\r' },
+        };
+
+        if (!cooked_read_console_w(comm, state, host_io, info, input_bytes, 251))
+        {
+            return false;
+        }
+
+        auto* history_by_exe = state.try_command_history_for_exe(exe);
+        if (history_by_exe == nullptr)
+        {
+            return false;
+        }
+
+        if (history_for_process->commands().size() != 1 || history_for_process->commands()[0] != L"abc")
+        {
+            return false;
+        }
+
+        ULONG length_bytes = 0;
+        if (!get_command_history_length_w(comm, state, host_io, info, exe, length_bytes, 252))
+        {
+            return false;
+        }
+
+        if (length_bytes != 8) // "abc\0" (4 UTF-16 units)
+        {
+            return false;
+        }
+
+        std::wstring history{};
+        if (!get_command_history_w(comm, state, host_io, info, exe, history, 253))
+        {
+            return false;
+        }
+
+        return history.size() == 4 && history.substr(0, 3) == L"abc" && history[3] == L'\0';
+    }
+
+    bool test_command_history_set_number_of_commands_clamps_oldest_entries()
+    {
+        MemoryComm comm{};
+        oc::condrv::ServerState state{};
+        TestHostIo host_io{};
+
+        constexpr std::wstring_view exe = L"cmd.exe";
+        const auto info = connect_with_app_name(comm, state, host_io, 25101, 25102, exe, 260);
+
+        // Set per-exe max commands to 2.
+        {
+            constexpr ULONG api_size = sizeof(CONSOLE_SETNUMBEROFCOMMANDS_MSG);
+            constexpr ULONG header_size = sizeof(CONSOLE_MSG_HEADER);
+            constexpr ULONG read_offset = api_size + header_size;
+            const ULONG exe_bytes = static_cast<ULONG>(exe.size() * sizeof(wchar_t));
+
+            oc::condrv::IoPacket packet{};
+            packet.payload.user_defined = oc::condrv::UserDefinedPacket{};
+            packet.descriptor.identifier.LowPart = 261;
+            packet.descriptor.function = oc::condrv::console_io_user_defined;
+            packet.descriptor.process = info.process;
+            packet.descriptor.object = info.output;
+            packet.descriptor.input_size = read_offset + exe_bytes;
+            packet.descriptor.output_size = api_size;
+            packet.payload.user_defined.msg_header.ApiNumber = static_cast<ULONG>(ConsolepSetNumberOfCommands);
+            packet.payload.user_defined.msg_header.ApiDescriptorSize = api_size;
+
+            auto& body = packet.payload.user_defined.u.console_msg_l3.SetConsoleNumberOfCommandsW;
+            body.Unicode = TRUE;
+            body.NumCommands = 2;
+
+            comm.input.assign(packet.descriptor.input_size, std::byte{});
+            std::memcpy(comm.input.data() + read_offset, exe.data(), exe_bytes);
+
+            oc::condrv::BasicApiMessage<MemoryComm> message(comm, packet);
+            const auto outcome = oc::condrv::dispatch_message(state, message, host_io);
+            if (!outcome || message.completion().io_status.Status != oc::core::status_success)
+            {
+                return false;
+            }
+        }
+
+        static constexpr std::byte one[] = { std::byte{ 'o' }, std::byte{ 'n' }, std::byte{ 'e' }, std::byte{ '\r' } };
+        static constexpr std::byte two[] = { std::byte{ 't' }, std::byte{ 'w' }, std::byte{ 'o' }, std::byte{ '\r' } };
+        static constexpr std::byte three[] = { std::byte{ 't' }, std::byte{ 'h' }, std::byte{ 'r' }, std::byte{ 'e' }, std::byte{ 'e' }, std::byte{ '\r' } };
+
+        if (!cooked_read_console_w(comm, state, host_io, info, one, 262) ||
+            !cooked_read_console_w(comm, state, host_io, info, two, 263) ||
+            !cooked_read_console_w(comm, state, host_io, info, three, 264))
+        {
+            return false;
+        }
+
+        std::wstring history{};
+        if (!get_command_history_w(comm, state, host_io, info, exe, history, 265))
+        {
+            return false;
+        }
+
+        // Expect: "two\0three\0"
+        if (history.size() != 10)
+        {
+            return false;
+        }
+
+        return history.substr(0, 3) == L"two" && history[3] == L'\0' &&
+               history.substr(4, 5) == L"three" && history[9] == L'\0';
+    }
+
+    bool test_command_history_expunge_clears_history()
+    {
+        MemoryComm comm{};
+        oc::condrv::ServerState state{};
+        TestHostIo host_io{};
+
+        constexpr std::wstring_view exe = L"cmd.exe";
+        const auto info = connect_with_app_name(comm, state, host_io, 25201, 25202, exe, 270);
+
+        static constexpr std::byte input_bytes[] = { std::byte{ 'x' }, std::byte{ '\r' } };
+        if (!cooked_read_console_w(comm, state, host_io, info, input_bytes, 271))
+        {
+            return false;
+        }
+
+        // Expunge.
+        {
+            constexpr ULONG api_size = sizeof(CONSOLE_EXPUNGECOMMANDHISTORY_MSG);
+            constexpr ULONG header_size = sizeof(CONSOLE_MSG_HEADER);
+            constexpr ULONG read_offset = api_size + header_size;
+            const ULONG exe_bytes = static_cast<ULONG>(exe.size() * sizeof(wchar_t));
+
+            oc::condrv::IoPacket packet{};
+            packet.payload.user_defined = oc::condrv::UserDefinedPacket{};
+            packet.descriptor.identifier.LowPart = 272;
+            packet.descriptor.function = oc::condrv::console_io_user_defined;
+            packet.descriptor.process = info.process;
+            packet.descriptor.object = info.output;
+            packet.descriptor.input_size = read_offset + exe_bytes;
+            packet.descriptor.output_size = api_size;
+            packet.payload.user_defined.msg_header.ApiNumber = static_cast<ULONG>(ConsolepExpungeCommandHistory);
+            packet.payload.user_defined.msg_header.ApiDescriptorSize = api_size;
+
+            auto& body = packet.payload.user_defined.u.console_msg_l3.ExpungeConsoleCommandHistoryW;
+            body.Unicode = TRUE;
+
+            comm.input.assign(packet.descriptor.input_size, std::byte{});
+            std::memcpy(comm.input.data() + read_offset, exe.data(), exe_bytes);
+
+            oc::condrv::BasicApiMessage<MemoryComm> message(comm, packet);
+            const auto outcome = oc::condrv::dispatch_message(state, message, host_io);
+            if (!outcome || message.completion().io_status.Status != oc::core::status_success)
+            {
+                return false;
+            }
+        }
+
+        ULONG length_bytes = 123;
+        if (!get_command_history_length_w(comm, state, host_io, info, exe, length_bytes, 273))
+        {
+            return false;
+        }
+
+        return length_bytes == 0;
+    }
+
+    bool test_command_history_no_dup_flag_removes_prior_match()
+    {
+        MemoryComm comm{};
+        oc::condrv::ServerState state{};
+        TestHostIo host_io{};
+
+        constexpr std::wstring_view exe = L"cmd.exe";
+        const auto info = connect_with_app_name(comm, state, host_io, 25301, 25302, exe, 280);
+
+        state.set_history_info(state.history_buffer_size(), state.history_buffer_count(), HISTORY_NO_DUP_FLAG);
+
+        static constexpr std::byte one[] = { std::byte{ 'o' }, std::byte{ 'n' }, std::byte{ 'e' }, std::byte{ '\r' } };
+        static constexpr std::byte two[] = { std::byte{ 't' }, std::byte{ 'w' }, std::byte{ 'o' }, std::byte{ '\r' } };
+
+        if (!cooked_read_console_w(comm, state, host_io, info, one, 281) ||
+            !cooked_read_console_w(comm, state, host_io, info, two, 282) ||
+            !cooked_read_console_w(comm, state, host_io, info, one, 283))
+        {
+            return false;
+        }
+
+        std::wstring history{};
+        if (!get_command_history_w(comm, state, host_io, info, exe, history, 284))
+        {
+            return false;
+        }
+
+        // Expect: "two\0one\0"
+        if (history.size() != 8)
+        {
+            return false;
+        }
+
+        return history.substr(0, 3) == L"two" && history[3] == L'\0' &&
+               history.substr(4, 3) == L"one" && history[7] == L'\0';
+    }
+
     bool test_user_defined_deprecated_apis_return_not_implemented_and_zero_descriptor_bytes()
     {
         MemoryComm comm{};
@@ -9595,6 +10018,10 @@ bool run_condrv_raw_io_tests()
         { L"test_l3_add_get_and_remove_console_alias_w_round_trips", test_l3_add_get_and_remove_console_alias_w_round_trips },
         { L"test_l3_get_console_aliases_length_and_get_aliases_w_round_trips", test_l3_get_console_aliases_length_and_get_aliases_w_round_trips },
         { L"test_l3_get_console_alias_exes_length_and_get_alias_exes_w_round_trips", test_l3_get_console_alias_exes_length_and_get_alias_exes_w_round_trips },
+        { L"test_command_history_records_cooked_read_and_is_queryable", test_command_history_records_cooked_read_and_is_queryable },
+        { L"test_command_history_set_number_of_commands_clamps_oldest_entries", test_command_history_set_number_of_commands_clamps_oldest_entries },
+        { L"test_command_history_expunge_clears_history", test_command_history_expunge_clears_history },
+        { L"test_command_history_no_dup_flag_removes_prior_match", test_command_history_no_dup_flag_removes_prior_match },
         { L"test_user_defined_deprecated_apis_return_not_implemented_and_zero_descriptor_bytes", test_user_defined_deprecated_apis_return_not_implemented_and_zero_descriptor_bytes },
     };
 

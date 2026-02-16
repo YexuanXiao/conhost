@@ -17,6 +17,8 @@ This document tracks non-GUI test coverage of the replacement implementation in 
 1. `console_arguments_tests.cpp`
 - Explicit command payload parsing (`--`)
 - Unknown-token command start behavior
+- `--` and unknown-token boundaries stop further host-option parsing (flags after the boundary remain client tokens)
+- Win32-style escaping reconstruction for tricky tokens (space + trailing backslash) round-trips via `CommandLineToArgvW`
 - Compatibility flags (`--server`, `--signal`, `--width`, `--height`, `--headless`, `--vtmode`, `--inheritcursor`, `--textMeasurement`, `--feature pty`)
 - `-ForceNoHandoff`
 - Invalid feature handling
@@ -61,6 +63,7 @@ This document tracks non-GUI test coverage of the replacement implementation in 
 - Hex parse with prefix enforcement
 - Float parse success/failure
 - Integer and float formatting round-trip checks
+- Deterministic stress coverage for edge ranges (i32/u32/hex boundaries + round-trip loops)
 
 9. `session_tests.cpp`
 - Inherited-stdio runtime path exit-code behavior
@@ -92,7 +95,7 @@ This document tracks non-GUI test coverage of the replacement implementation in 
 - USER_DEFINED L3 query APIs (GetConsoleWindow, GetDisplayMode, GetKeyboardLayoutName, GetMouseInfo, GetSelectionInfo, GetConsoleProcessList)
 - USER_DEFINED L3 font/display APIs (GetNumberOfFonts/GetFontInfo/GetFontSize, Get/SetCurrentFont, SetDisplayMode)
 - USER_DEFINED L3 legacy compatibility stubs (SetKeyShortcuts, SetMenuClose, CharType, CursorMode, NlsMode, OS2 toggles, LocalEUDC)
-- USER_DEFINED L3 history APIs (GetHistory/SetHistory; command history APIs stubbed to return empty)
+- USER_DEFINED L3 history APIs (GetHistory/SetHistory + command history APIs: Expunge/SetNumber/GetLength/GetHistory)
 - USER_DEFINED `ConsolepGenerateCtrlEvent` best-effort forwarding via host IO (`send_end_task`)
 
 15. `condrv_input_wait_tests.cpp`
@@ -173,11 +176,19 @@ This document tracks non-GUI test coverage of the replacement implementation in 
 - Process-isolated runtime validation for the `openconsole_new.exe` executable:
   - `--headless --vtmode` ConPTY path emits output and propagates child exit code.
   - piped stdin reaches the hosted client (smoke coverage for the input pump + ConPTY attach semantics).
+  - `--server --headless` ConDrv server-mode path hosts a real console client using ConDrv handles and forwards basic input/output end-to-end.
+  - `--server --headless` ConDrv server-mode path decodes win32-input-mode sequences into `ReadConsoleInputW` key events (virtual-key metadata + Unicode payload).
 
 20. `com_embedding_integration_tests.cpp`
 - Out-of-proc COM `-Embedding` end-to-end harness:
   - activates the COM local server and calls `IConsoleHandoff::EstablishHandoff`.
   - validates that the COM handshake does not crash and the server remains responsive (beyond unit-only activation coverage).
+
+21. `condrv_vt_fuzz_tests.cpp`
+- Deterministic fuzz/bounds hardening for VT parsing:
+  - fuzzes `vt_input::try_decode_vt` with biased random prefixes and asserts token invariants (`bytes_consumed`, no `text_units`, and `need_more_data` only on ESC/C1 CSI).
+  - fuzzes the streaming VT output parser (`apply_text_to_screen_buffer`) across randomized chunk boundaries and asserts `ScreenBuffer` invariants (cursor/window bounds, full buffer readback, monotonic revision).
+  - adds targeted bounds tests for overlong CSI/ESC-dispatch abandonment and OSC title payload truncation.
 
 ## 3. Execution
 
@@ -190,5 +201,5 @@ ctest --test-dir build-new --output-on-failure
 ## 4. Remaining test expansion opportunities
 
 1. Expand process-isolated integration coverage for the full executable startup matrix (`-Embedding`, `--server`, `--headless`, legacy policy combinations).
-2. Add stress tests for numeric conversion edge ranges and malformed Unicode input.
+2. Add stress tests for malformed Unicode input.
 3. Add high-volume runtime I/O pump tests with synthetic pipe traffic.
