@@ -31,6 +31,13 @@
   - `ScreenBuffer` now retains a small VT parse state machine so split ESC/CSI/OSC/DCS-like sequences do not leak literal escape bytes into the buffer model.
   - added deterministic unit coverage for split OSC/CSI/ESC-dispatch and string-terminator cases.
   - added a dedicated design doc (`condrv_vt_output_streaming.md`) and updated VT docs that previously called out chunk-local parsing limitations.
+- Completed higher-level process-isolated integration test coverage (beyond the in-memory ConDrv harness):
+  - `process_integration_tests.cpp` launches `openconsole_new.exe` and validates the headless ConPTY runtime path (`--headless --vtmode`) including exit-code propagation and piped-stdin reachability.
+  - added deterministic per-run log capture for debugging failures.
+  - fixed ConPTY client spawning so redirected host stdin is not observed by the client as direct (EOF) input; stdin is routed through the pseudo console transport while stdout/stderr remain observable by the host.
+- Completed COM `-Embedding` end-to-end integration harness:
+  - added a proxy/stub DLL build from the inbox IDL (MIDL) and per-user registry wiring for deterministic out-of-proc COM activation in tests.
+  - exercised `IConsoleHandoff::EstablishHandoff` end-to-end without relying on the in-memory ConDrv harness.
 
 ## 2026-02-14
 - Read and incorporated all constraints from `AGENTS.md`.
@@ -360,3 +367,8 @@
 - Classic conhost window/UI parity is still incomplete: `WindowHost` now renders the `ScreenBuffer` viewport text (monochrome, snapshot-based), but it does not yet render attributes/colors/cursor and there is no selection/clipboard/scrollbars/IME/accessibility or window input injection (`new/docs/microtask_backlog.md`, `new/docs/conhost_behavior_imitation_matrix.md`).
 - Integration testing is missing: no process-isolated end-to-end tests that run real client programs against `--server` and validate observable behavior (`new/docs/microtask_backlog.md`).
 - Hardening/perf backlog remains: CLI edge-case parity tests, stress tests (Unicode/malformed input/high-volume I/O), and perf instrumentation hooks are not done (`new/docs/microtask_backlog.md`).
+
+
+If “non-GUI mode” means headless ConPTY hosting (openconsole_new.exe --headless --vtmode -- <cmd>): the core path is implemented and has process-isolated integration tests (process_integration_tests.cpp) covering output + exit code propagation and piped-stdin reachability.
+
+If “non-GUI mode” means classic conhost replacement in --server ConDrv mode: a large, unit-tested dispatch surface exists (Write/ReadConsole, input queue + reply-pending, VT output parsing, VT win32-input-mode decoding, cooked line editing, etc.), but it is not yet validated end-to-end with a real client process (no process-isolated --server integration harness; test_coverage_plan.md still lists this as a remaining expansion), and there are still parity/hardening gaps tracked in microtask_backlog.md / conhost_behavior_imitation_matrix.md (CLI edge cases, stress/fuzz malformed input, deeper protocol/handoff parity).

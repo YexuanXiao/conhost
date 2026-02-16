@@ -169,6 +169,16 @@ This document tracks non-GUI test coverage of the replacement implementation in 
   - captures viewport attributes and color table
   - revision counter increments on visible mutations
 
+19. `process_integration_tests.cpp`
+- Process-isolated runtime validation for the `openconsole_new.exe` executable:
+  - `--headless --vtmode` ConPTY path emits output and propagates child exit code.
+  - piped stdin reaches the hosted client (smoke coverage for the input pump + ConPTY attach semantics).
+
+20. `com_embedding_integration_tests.cpp`
+- Out-of-proc COM `-Embedding` end-to-end harness:
+  - activates the COM local server and calls `IConsoleHandoff::EstablishHandoff`.
+  - validates that the COM handshake does not crash and the server remains responsive (beyond unit-only activation coverage).
+
 ## 3. Execution
 
 Run:
@@ -179,6 +189,6 @@ ctest --test-dir build-new --output-on-failure
 
 ## 4. Remaining test expansion opportunities
 
-1. Introduce deterministic integration tests for full executable startup matrix (`-Embedding`, `--server`, `--headless`, legacy policy combinations) with process isolation.
+1. Expand process-isolated integration coverage for the full executable startup matrix (`-Embedding`, `--server`, `--headless`, legacy policy combinations).
 2. Add stress tests for numeric conversion edge ranges and malformed Unicode input.
 3. Add high-volume runtime I/O pump tests with synthetic pipe traffic.

@@ -444,10 +444,7 @@ namespace oc::runtime
             SECURITY_ATTRIBUTES security{};
             security.nLength = sizeof(security);
             security.lpSecurityDescriptor = nullptr;
-            // `CreatePseudoConsole` spawns a conhost instance and inherits the
-            // provided pipe handles. Mark the pipe handles inheritable so the
-            // underlying ConPTY host can receive them.
-            security.bInheritHandle = TRUE;
+            security.bInheritHandle = FALSE;
 
             if (::CreatePipe(read_end.put(), write_end.put(), &security, 0) == FALSE)
             {
@@ -743,10 +740,15 @@ namespace oc::runtime
             core::UniqueHandle& pty_input_write,
             UniquePseudoConsole& pseudo_console,
             bool& had_data,
+            bool& host_input_pipe_eof,
             logging::Logger& logger)
         {
             had_data = false;
             if (!pty_input_write.valid())
+            {
+                return {};
+            }
+            if (host_input_pipe_eof)
             {
                 return {};
             }
@@ -810,7 +812,11 @@ namespace oc::runtime
                     const DWORD error = ::GetLastError();
                     if (error == ERROR_BROKEN_PIPE)
                     {
-                        logger.log(logging::LogLevel::debug, L"Host input pipe reached EOF");
+                        if (!host_input_pipe_eof)
+                        {
+                            logger.log(logging::LogLevel::debug, L"Host input pipe reached EOF");
+                        }
+                        host_input_pipe_eof = true;
                         return {};
                     }
 
@@ -833,7 +839,11 @@ namespace oc::runtime
                     const DWORD error = ::GetLastError();
                     if (error == ERROR_BROKEN_PIPE)
                     {
-                        logger.log(logging::LogLevel::debug, L"Host input pipe closed during read");
+                        if (!host_input_pipe_eof)
+                        {
+                            logger.log(logging::LogLevel::debug, L"Host input pipe reached EOF");
+                        }
+                        host_input_pipe_eof = true;
                         return {};
                     }
                     return std::unexpected(SessionError{
@@ -944,6 +954,11 @@ namespace oc::runtime
                 return std::unexpected(process_result.error());
             }
             core::UniqueHandle process = std::move(process_result.value());
+            // These ends are owned by the pseudo console host after creation;
+            // close our references once the client is started so broken pipe
+            // detection behaves as expected. (Matches Microsoft guidance.)
+            pty_input_read.reset();
+            pty_output_write.reset();
 
             ConsoleModeGuard mode_guard(options.host_input, options.host_output);
             logger.log(
@@ -960,6 +975,7 @@ namespace oc::runtime
             }
 
             bool signaled_termination = false;
+            bool host_input_pipe_eof = false;
             for (;;)
             {
                 if (options.signal_handle)
@@ -985,13 +1001,14 @@ namespace oc::runtime
                 }
 
                 bool had_input = false;
-                if (!signaled_termination)
+                if (!signaled_termination && !host_input_pipe_eof)
                 {
                     if (auto input_result = pump_console_input_to_pseudoconsole(
                              options.host_input,
                              pty_input_write,
                              pseudo_console,
                              had_input,
+                             host_input_pipe_eof,
                              logger);
                          !input_result)
                     {

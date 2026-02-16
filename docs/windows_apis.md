@@ -13,6 +13,8 @@ This document lists Windows APIs used by the reimplementation in `new/`.
 - `Sleep`
 - `GetExitCodeProcess`
 - `GetStdHandle`
+- `GetModuleFileNameW` (tests)
+- `GetTickCount64` (tests)
 - `InitializeProcThreadAttributeList`
 - `UpdateProcThreadAttribute`
 - `DeleteProcThreadAttributeList`
@@ -39,6 +41,8 @@ This document lists Windows APIs used by the reimplementation in `new/`.
 - `CloseHandle`
 - `LocalFree`
 - `CreateFileW`
+- `DeleteFileW` (tests)
+- `GetFileAttributesW` (tests)
 - `CreateEventW`
 - `ReadFile`
 - `GetFileSizeEx`
@@ -48,6 +52,7 @@ This document lists Windows APIs used by the reimplementation in `new/`.
 - `CancelSynchronousIo`
 - `DeviceIoControl`
 - `GetHandleInformation`
+- `SetHandleInformation`
 - `PeekNamedPipe`
 - `SetEvent`
 - `ResetEvent`
