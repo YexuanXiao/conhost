@@ -2,10 +2,96 @@
 
 #include "core/assert.hpp"
 
+#include <optional>
 #include <vector>
 
 namespace oc::logging
 {
+    namespace
+    {
+        [[nodiscard]] std::optional<std::wstring> read_environment(const std::wstring_view name) noexcept
+        {
+            const DWORD required = ::GetEnvironmentVariableW(name.data(), nullptr, 0);
+            if (required == 0)
+            {
+                return std::nullopt;
+            }
+
+            std::wstring value(required, L'\0');
+            const DWORD written = ::GetEnvironmentVariableW(name.data(), value.data(), required);
+            if (written == 0)
+            {
+                return std::nullopt;
+            }
+
+            value.resize(written);
+            return value;
+        }
+
+        [[nodiscard]] std::wstring append_path_component(std::wstring base, const std::wstring_view component)
+        {
+            if (!base.empty())
+            {
+                const wchar_t tail = base.back();
+                if (tail != L'\\' && tail != L'/')
+                {
+                    base.push_back(L'\\');
+                }
+            }
+
+            base.append(component);
+            return base;
+        }
+
+        [[nodiscard]] std::expected<ULONGLONG, DWORD> query_process_start_time() noexcept
+        {
+            FILETIME creation_time{};
+            FILETIME exit_time{};
+            FILETIME kernel_time{};
+            FILETIME user_time{};
+            if (::GetProcessTimes(
+                    ::GetCurrentProcess(),
+                    &creation_time,
+                    &exit_time,
+                    &kernel_time,
+                    &user_time) == FALSE)
+            {
+                return std::unexpected(::GetLastError());
+            }
+
+            const ULONGLONG low = static_cast<ULONGLONG>(creation_time.dwLowDateTime);
+            const ULONGLONG high = static_cast<ULONGLONG>(creation_time.dwHighDateTime) << 32;
+            return high | low;
+        }
+
+        [[nodiscard]] std::expected<void, DWORD> ensure_directory_exists(const std::wstring& path) noexcept
+        {
+            if (::CreateDirectoryW(path.c_str(), nullptr) != FALSE)
+            {
+                return {};
+            }
+
+            const DWORD error = ::GetLastError();
+            if (error != ERROR_ALREADY_EXISTS)
+            {
+                return std::unexpected(error);
+            }
+
+            const DWORD attributes = ::GetFileAttributesW(path.c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES)
+            {
+                return std::unexpected(::GetLastError());
+            }
+
+            if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+            {
+                return std::unexpected(ERROR_DIRECTORY);
+            }
+
+            return {};
+        }
+    }
+
     void DebugOutputSink::write(const std::wstring_view line) noexcept
     {
         std::wstring with_newline{ line };
@@ -33,6 +119,59 @@ namespace oc::logging
             return std::unexpected(::GetLastError());
         }
         return std::shared_ptr<FileLogSink>(new FileLogSink(std::move(file)));
+    }
+
+    std::expected<std::wstring, DWORD> FileLogSink::resolve_default_log_path() noexcept
+    {
+        std::optional<std::wstring> temp_root = read_environment(L"TEMP");
+        if (!temp_root || temp_root->empty())
+        {
+            temp_root = read_environment(L"TMP");
+        }
+        if (!temp_root || temp_root->empty())
+        {
+            return std::unexpected(ERROR_ENVVAR_NOT_FOUND);
+        }
+
+        std::wstring console_directory;
+        try
+        {
+            console_directory = append_path_component(*temp_root, L"console");
+        }
+        catch (...)
+        {
+            return std::unexpected(ERROR_OUTOFMEMORY);
+        }
+
+        if (auto ensured = ensure_directory_exists(console_directory); !ensured)
+        {
+            return std::unexpected(ensured.error());
+        }
+
+        auto start_time = query_process_start_time();
+        if (!start_time)
+        {
+            return std::unexpected(start_time.error());
+        }
+
+        std::wstring file_name;
+        std::wstring path;
+        try
+        {
+            file_name.append(L"console_");
+            file_name.append(std::to_wstring(::GetCurrentProcessId()));
+            file_name.push_back(L'_');
+            file_name.append(std::to_wstring(*start_time));
+            file_name.append(L".log");
+
+            path = append_path_component(std::move(console_directory), file_name);
+        }
+        catch (...)
+        {
+            return std::unexpected(ERROR_OUTOFMEMORY);
+        }
+
+        return path;
     }
 
     void FileLogSink::write(const std::wstring_view line) noexcept

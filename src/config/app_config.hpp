@@ -22,6 +22,7 @@ namespace oc::config
         std::wstring locale_override;
         bool dry_run{ false };
         bool enable_debug_sink{ true };
+        bool enable_file_logging{ false };
         std::wstring log_file_path;
         bool prefer_pseudoconsole{ true };
         bool allow_embedding_passthrough{ true };

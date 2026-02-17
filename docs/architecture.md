@@ -15,7 +15,7 @@
 - `src/cli`
   - Compatibility parser for OpenConsole command-line behavior.
 - `src/config`
-  - Runtime configuration loading from environment and optional config file.
+  - Runtime configuration loading from a per-user baseline file (`~/.conhost`), optional explicit config path (`OPENCONSOLE_NEW_CONFIG`), and environment overrides.
 - `src/localization`
   - Locale selection and localized message retrieval.
 - `src/logging`

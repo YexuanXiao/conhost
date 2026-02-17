@@ -41,6 +41,7 @@ This document lists Windows APIs used by the reimplementation in `new/`.
 - `CloseHandle`
 - `LocalFree`
 - `CreateFileW`
+- `CreateDirectoryW`
 - `DeleteFileW` (tests)
 - `GetFileAttributesW` (tests)
 - `CreateEventW`
@@ -92,6 +93,7 @@ This document lists Windows APIs used by the reimplementation in `new/`.
 - `GetLastError`
 - `GetCurrentProcessId`
 - `GetProcessId`
+- `GetProcessTimes`
 
 ## System Metrics
 - `GetSystemMetrics`

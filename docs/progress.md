@@ -11,6 +11,11 @@
 - Hardened the ConDrv server completion path to eliminate intermittent `ERROR_OPERATION_ABORTED` (995) failures from `IOCTL_CONDRV_COMPLETE_IO`:
   - removed `IOCTL_CONDRV_COMPLETE_IO` from the hot path.
   - completions are now submitted via the completion input parameter on the next `IOCTL_CONDRV_READ_IO` call, keeping the message alive until completion submission so completion write buffers remain valid.
+- Added default file-log path behavior with opt-in enablement:
+  - file logging is now disabled by default (`enable_file_logging=0` / `OPENCONSOLE_NEW_ENABLE_FILE_LOGGING=0`).
+  - when enabled without an explicit path, logs are written to `%TEMP%\\console\\<pid>_<process_start_filetime>.log` (fallback `%TMP%`).
+  - startup logs now include PID + full command line.
+  - runtime logs now explicitly record interaction operations/results for external process launches and default-terminal host-signal/delegation paths.
 
 ## 2026-02-16
 - Implemented VT insert/replace mode (IRM, `CSI 4 h` / `CSI 4 l`) for printable output when `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is enabled:
@@ -391,6 +396,11 @@
 - Hardened server-handle startup shutdown semantics:
   - `--server` + default-terminal delegation now waits only on the process handle returned by `IConsoleHandoff::EstablishHandoff` (matching upstream inbox conhost) to avoid premature exits from waitable file handles.
   - ConPTY-style `--signal` pipes are no longer treated as waitable stop events; `SignalPipeMonitor` drains them and converts disconnection into an explicit stop event for the ConDrv server loop.
+- Added startup support for a per-user default config file at `~/.conhost`:
+  - `ConfigLoader::load()` now probes `USERPROFILE` (then `HOME`, then `HOMEDRIVE` + `HOMEPATH`) and attempts to read `.conhost` as a baseline config file.
+  - missing user config files are ignored, while parse/read errors on present files still surface as configuration errors.
+  - `OPENCONSOLE_NEW_CONFIG` remains supported and takes precedence over `~/.conhost` when explicitly set.
+  - added deterministic tests for user-config loading, precedence, and missing-file behavior.
 
 ## Next Milestone
 

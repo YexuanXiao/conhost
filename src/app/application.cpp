@@ -76,24 +76,52 @@ namespace oc::app
         {
             logger.add_sink(std::make_shared<logging::DebugOutputSink>());
         }
-        if (!config.log_file_path.empty())
+        if (config.enable_file_logging)
         {
-            auto file_sink = logging::FileLogSink::create(config.log_file_path);
-            if (file_sink)
+            std::wstring file_log_path = config.log_file_path;
+            if (file_log_path.empty())
             {
-                logger.add_sink(file_sink.value());
+                auto default_path = logging::FileLogSink::resolve_default_log_path();
+                if (default_path)
+                {
+                    file_log_path = std::move(default_path.value());
+                }
+                else
+                {
+                    logger.log(
+                        logging::LogLevel::warning,
+                        L"File logging disabled; default path resolution failed with error={}",
+                        default_path.error());
+                }
+            }
+
+            if (!file_log_path.empty())
+            {
+                auto file_sink = logging::FileLogSink::create(file_log_path);
+                if (file_sink)
+                {
+                    logger.add_sink(file_sink.value());
+                    logger.log(logging::LogLevel::info, L"File logging enabled at {}", file_log_path);
+                }
+                else
+                {
+                    logger.log(logging::LogLevel::warning, L"File logging disabled; CreateFileW error={}", file_sink.error());
+                }
             }
             else
             {
-                logger.log(logging::LogLevel::warning, L"File logging disabled; CreateFileW error={}", file_sink.error());
+                logger.log(logging::LogLevel::warning, L"File logging disabled; no usable log path");
             }
         }
 
+        const DWORD current_pid = ::GetCurrentProcessId();
+        const std::wstring startup_command_line = ::GetCommandLineW();
+        logger.log(logging::LogLevel::info, L"Startup context: pid={}, command_line={}", current_pid, startup_command_line);
         logger.log(logging::LogLevel::info, L"{}", localizer.text(localization::StringId::startup));
         logger.log(logging::LogLevel::debug, L"Locale selected: {}", localizer.locale());
 
         auto parsed_args = cli::ConsoleArguments::parse(
-            ::GetCommandLineW(),
+            startup_command_line,
             core::HandleView(::GetStdHandle(STD_INPUT_HANDLE)),
             core::HandleView(::GetStdHandle(STD_OUTPUT_HANDLE)));
         if (!parsed_args)

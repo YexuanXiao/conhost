@@ -187,6 +187,19 @@ namespace oc::runtime
                 {
                 }
             }
+            else
+            {
+                try
+                {
+                    logger.log(
+                        logging::LogLevel::debug,
+                        L"ConsoleControl(NotifyConsoleApplication) succeeded (pid={})",
+                        process_id);
+                }
+                catch (...)
+                {
+                }
+            }
         }
 
         void end_task_best_effort(
@@ -218,6 +231,18 @@ namespace oc::runtime
                 if (status >= 0)
                 {
                     ended = true;
+                    try
+                    {
+                        logger.log(
+                            logging::LogLevel::debug,
+                            L"ConsoleControl(EndTask) succeeded (pid={}, event={}, flags={})",
+                            process_id,
+                            event_type,
+                            ctrl_flags);
+                    }
+                    catch (...)
+                    {
+                    }
                 }
                 else
                 {
@@ -265,6 +290,19 @@ namespace oc::runtime
                             L"TerminateProcess failed for EndTask fallback (pid={}, error={})",
                             process_id,
                             ::GetLastError());
+                    }
+                    catch (...)
+                    {
+                    }
+                }
+                else
+                {
+                    try
+                    {
+                        logger.log(
+                            logging::LogLevel::debug,
+                            L"TerminateProcess fallback succeeded for EndTask (pid={})",
+                            process_id);
                     }
                     catch (...)
                     {
@@ -552,8 +590,10 @@ namespace oc::runtime
             const core::HandleView input_event,
             const CONSOLE_PORTABLE_ATTACH_MSG& attach_msg,
             const core::HandleView signal_pipe,
-            const core::HandleView inbox_process) noexcept
+            const core::HandleView inbox_process,
+            logging::Logger& logger) noexcept
         {
+            logger.log(logging::LogLevel::info, L"Invoking IConsoleHandoff::EstablishHandoff");
             const CoInitScope coinit(::CoInitializeEx(nullptr, COINIT_MULTITHREADED));
             if (FAILED(coinit.result()))
             {
@@ -602,6 +642,12 @@ namespace oc::runtime
                     .win32_error = ERROR_INVALID_HANDLE,
                 });
             }
+
+            const DWORD delegated_pid = ::GetProcessId(process.get());
+            logger.log(
+                logging::LogLevel::info,
+                L"IConsoleHandoff::EstablishHandoff succeeded (delegated_host_pid={})",
+                delegated_pid);
 
             return process;
         }
@@ -1076,7 +1122,8 @@ namespace oc::runtime
 
         [[nodiscard]] std::expected<core::UniqueHandle, SessionError> spawn_process_with_pseudoconsole(
             const std::wstring& command_line,
-            ProcThreadAttributeList& attributes)
+            ProcThreadAttributeList& attributes,
+            logging::Logger& logger)
         {
             const auto expanded_command_line = [&]() -> std::expected<std::wstring, SessionError> {
                 const DWORD required = ::ExpandEnvironmentStringsW(command_line.c_str(), nullptr, 0);
@@ -1104,6 +1151,11 @@ namespace oc::runtime
             {
                 return std::unexpected(expanded_command_line.error());
             }
+
+            logger.log(
+                logging::LogLevel::info,
+                L"Launching client process (ConPTY): command_line={}",
+                expanded_command_line.value());
 
             std::vector<wchar_t> mutable_command_line(
                 expanded_command_line->begin(),
@@ -1149,9 +1201,15 @@ namespace oc::runtime
                 &info);
             if (created == FALSE)
             {
+                const DWORD create_error = ::GetLastError();
+                logger.log(
+                    logging::LogLevel::error,
+                    L"CreateProcessW failed for ConPTY client launch: error={}, command_line={}",
+                    create_error,
+                    expanded_command_line.value());
                 return std::unexpected(SessionError{
                     .context = L"CreateProcessW with pseudo console failed",
-                    .win32_error = ::GetLastError(),
+                    .win32_error = create_error,
                 });
             }
 
@@ -1159,6 +1217,10 @@ namespace oc::runtime
             core::UniqueHandle thread(info.hThread);
             OC_ASSERT(process.valid());
             OC_ASSERT(thread.valid());
+            logger.log(
+                logging::LogLevel::info,
+                L"Client process launched (ConPTY): pid={}",
+                info.dwProcessId);
 
             return process;
         }
@@ -1166,7 +1228,8 @@ namespace oc::runtime
         [[nodiscard]] std::expected<core::UniqueHandle, SessionError> spawn_process_inherited_stdio(
             const std::wstring& command_line,
             core::HandleView std_in,
-            core::HandleView std_out)
+            core::HandleView std_out,
+            logging::Logger& logger)
         {
             const auto expanded_command_line = [&]() -> std::expected<std::wstring, SessionError> {
                 const DWORD required = ::ExpandEnvironmentStringsW(command_line.c_str(), nullptr, 0);
@@ -1195,6 +1258,11 @@ namespace oc::runtime
                 return std::unexpected(expanded_command_line.error());
             }
 
+            logger.log(
+                logging::LogLevel::info,
+                L"Launching client process (inherited stdio): command_line={}",
+                expanded_command_line.value());
+
             std::vector<wchar_t> mutable_command_line(
                 expanded_command_line->begin(),
                 expanded_command_line->end());
@@ -1221,9 +1289,15 @@ namespace oc::runtime
                 &info);
             if (created == FALSE)
             {
+                const DWORD create_error = ::GetLastError();
+                logger.log(
+                    logging::LogLevel::error,
+                    L"CreateProcessW failed for inherited-stdio client launch: error={}, command_line={}",
+                    create_error,
+                    expanded_command_line.value());
                 return std::unexpected(SessionError{
                     .context = L"CreateProcessW inherited stdio failed",
-                    .win32_error = ::GetLastError(),
+                    .win32_error = create_error,
                 });
             }
 
@@ -1231,6 +1305,10 @@ namespace oc::runtime
             core::UniqueHandle thread(info.hThread);
             OC_ASSERT(process.valid());
             OC_ASSERT(thread.valid());
+            logger.log(
+                logging::LogLevel::info,
+                L"Client process launched (inherited stdio): pid={}",
+                info.dwProcessId);
             return process;
         }
 
@@ -1566,7 +1644,7 @@ namespace oc::runtime
                 return std::unexpected(update_result.error());
             }
 
-            auto process_result = spawn_process_with_pseudoconsole(options.client_command_line, attributes);
+            auto process_result = spawn_process_with_pseudoconsole(options.client_command_line, attributes, logger);
             if (!process_result)
             {
                 return std::unexpected(process_result.error());
@@ -1601,7 +1679,19 @@ namespace oc::runtime
                     const DWORD signal_state = ::WaitForSingleObject(options.signal_handle.get(), 0);
                     if (signal_state == WAIT_OBJECT_0)
                     {
-                        ::TerminateProcess(process.get(), ERROR_CANCELLED);
+                        if (::TerminateProcess(process.get(), ERROR_CANCELLED) == FALSE)
+                        {
+                            logger.log(
+                                logging::LogLevel::warning,
+                                L"TerminateProcess failed after signal-handle shutdown request (error={})",
+                                ::GetLastError());
+                        }
+                        else
+                        {
+                            logger.log(
+                                logging::LogLevel::info,
+                                L"Signal handle requested shutdown; terminated ConPTY client process");
+                        }
                         signaled_termination = true;
                     }
                 }
@@ -1656,15 +1746,17 @@ namespace oc::runtime
                 });
             }
 
+            logger.log(logging::LogLevel::info, L"ConPTY client process exited with code {}", exit_code);
             return exit_code;
         }
 
-        [[nodiscard]] std::expected<DWORD, SessionError> run_with_inherited_stdio(const SessionOptions& options)
+        [[nodiscard]] std::expected<DWORD, SessionError> run_with_inherited_stdio(const SessionOptions& options, logging::Logger& logger)
         {
             auto process_result = spawn_process_inherited_stdio(
                 options.client_command_line,
                 options.host_input,
-                options.host_output);
+                options.host_output,
+                logger);
             if (!process_result)
             {
                 return std::unexpected(process_result.error());
@@ -1681,7 +1773,19 @@ namespace oc::runtime
                     INFINITE);
                 if (wait_result == WAIT_OBJECT_0 + 1)
                 {
-                    ::TerminateProcess(process.get(), ERROR_CANCELLED);
+                    if (::TerminateProcess(process.get(), ERROR_CANCELLED) == FALSE)
+                    {
+                        logger.log(
+                            logging::LogLevel::warning,
+                            L"TerminateProcess failed after inherited-stdio signal shutdown request (error={})",
+                            ::GetLastError());
+                    }
+                    else
+                    {
+                        logger.log(
+                            logging::LogLevel::info,
+                            L"Signal handle requested shutdown; terminated inherited-stdio client process");
+                    }
                 }
                 else if (wait_result != WAIT_OBJECT_0)
                 {
@@ -1712,6 +1816,7 @@ namespace oc::runtime
                 });
             }
 
+            logger.log(logging::LogLevel::info, L"Inherited-stdio client process exited with code {}", exit_code);
             return exit_code;
         }
     }
@@ -1903,17 +2008,22 @@ namespace oc::runtime
                                                     input_available_event.view(),
                                                     attach,
                                                     signal_pipe_pair->write_end.view(),
-                                                    inbox_process->view());
+                                                    inbox_process->view(),
+                                                    logger);
                                                 if (delegated_process)
                                                 {
-                                                    logger.log(logging::LogLevel::info, L"Default-terminal delegation established; waiting for delegated host");
-
-                                                    // The delegated host owns the input event after a successful handoff.
-                                                    input_available_event.reset();
-
                                                     const DWORD client_pid = attach.Process > std::numeric_limits<DWORD>::max()
                                                         ? 0
                                                         : static_cast<DWORD>(attach.Process);
+                                                    const DWORD delegated_pid = ::GetProcessId(delegated_process->get());
+                                                    logger.log(
+                                                        logging::LogLevel::info,
+                                                        L"Default-terminal delegation established; delegated_host_pid={}, client_pid={}, waiting for delegated host exit",
+                                                        delegated_pid,
+                                                        client_pid);
+
+                                                    // The delegated host owns the input event after a successful handoff.
+                                                    input_available_event.reset();
 
                                                     struct DelegatedHostSignalTarget final : HostSignalTarget
                                                     {
@@ -1936,6 +2046,10 @@ namespace oc::runtime
 
                                                         void notify_console_application(const DWORD process_id) noexcept override
                                                         {
+                                                            logger.log(
+                                                                logging::LogLevel::debug,
+                                                                L"Host-signal request: notify_console_application(pid={})",
+                                                                process_id);
                                                             notify_console_application_best_effort(
                                                                 console_control,
                                                                 rtl_nt_status_to_dos_error,
@@ -1946,10 +2060,19 @@ namespace oc::runtime
                                                         void set_foreground(const DWORD /*process_handle_value*/, const bool /*is_foreground*/) noexcept override
                                                         {
                                                             // GH#13211 parity: upstream ignores this (legacy callers only).
+                                                            logger.log(
+                                                                logging::LogLevel::debug,
+                                                                L"Host-signal request: set_foreground ignored for compatibility");
                                                         }
 
                                                         void end_task(const DWORD process_id, const DWORD event_type, const DWORD ctrl_flags) noexcept override
                                                         {
+                                                            logger.log(
+                                                                logging::LogLevel::debug,
+                                                                L"Host-signal request: end_task(pid={}, event={}, flags={})",
+                                                                process_id,
+                                                                event_type,
+                                                                ctrl_flags);
                                                             end_task_best_effort(
                                                                 console_control,
                                                                 rtl_nt_status_to_dos_error,
@@ -1961,11 +2084,20 @@ namespace oc::runtime
 
                                                         void signal_pipe_disconnected() noexcept override
                                                         {
+                                                            logger.log(
+                                                                logging::LogLevel::info,
+                                                                L"Host-signal pipe disconnected");
                                                             if (fallback_pid == 0)
                                                             {
                                                                 return;
                                                             }
 
+                                                            logger.log(
+                                                                logging::LogLevel::info,
+                                                                L"Host-signal disconnect fallback: end_task(pid={}, event={}, flags={})",
+                                                                fallback_pid,
+                                                                static_cast<unsigned long>(CTRL_CLOSE_EVENT),
+                                                                static_cast<unsigned long>(core::console_ctrl_close_flag));
                                                             end_task_best_effort(
                                                                 console_control,
                                                                 rtl_nt_status_to_dos_error,
@@ -2033,6 +2165,11 @@ namespace oc::runtime
                                                         });
                                                     }
 
+                                                    logger.log(
+                                                        logging::LogLevel::info,
+                                                        L"Delegated host process exited: pid={}, exit_code={}",
+                                                        delegated_pid,
+                                                        exit_code);
                                                     return exit_code;
                                                 }
 
@@ -2152,6 +2289,6 @@ namespace oc::runtime
             return run_with_pseudoconsole(options, logger);
         }
 
-        return run_with_inherited_stdio(options);
+        return run_with_inherited_stdio(options, logger);
     }
 }

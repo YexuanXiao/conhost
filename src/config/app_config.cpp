@@ -6,6 +6,7 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -14,10 +15,16 @@ namespace oc::config
     namespace
     {
         constexpr std::wstring_view kConfigPathEnv = L"OPENCONSOLE_NEW_CONFIG";
+        constexpr std::wstring_view kUserProfileEnv = L"USERPROFILE";
+        constexpr std::wstring_view kHomeEnv = L"HOME";
+        constexpr std::wstring_view kHomeDriveEnv = L"HOMEDRIVE";
+        constexpr std::wstring_view kHomePathEnv = L"HOMEPATH";
+        constexpr std::wstring_view kDefaultUserConfigName = L".conhost";
         constexpr std::wstring_view kLocaleEnv = L"OPENCONSOLE_NEW_LOCALE";
         constexpr std::wstring_view kDryRunEnv = L"OPENCONSOLE_NEW_DRY_RUN";
         constexpr std::wstring_view kLogLevelEnv = L"OPENCONSOLE_NEW_LOG_LEVEL";
         constexpr std::wstring_view kLogFileEnv = L"OPENCONSOLE_NEW_LOG_FILE";
+        constexpr std::wstring_view kEnableFileLoggingEnv = L"OPENCONSOLE_NEW_ENABLE_FILE_LOGGING";
         constexpr std::wstring_view kDebugSinkEnv = L"OPENCONSOLE_NEW_DEBUG_SINK";
         constexpr std::wstring_view kPreferPtyEnv = L"OPENCONSOLE_NEW_PREFER_PTY";
         constexpr std::wstring_view kEmbeddingPassthroughEnv = L"OPENCONSOLE_NEW_ALLOW_EMBEDDING_PASSTHROUGH";
@@ -192,6 +199,95 @@ namespace oc::config
             return wide;
         }
 
+        [[nodiscard]] std::wstring append_path_component(std::wstring base, const std::wstring_view component) noexcept
+        {
+            if (!base.empty())
+            {
+                const wchar_t tail = base.back();
+                if (tail != L'\\' && tail != L'/')
+                {
+                    base.push_back(L'\\');
+                }
+            }
+
+            base.append(component);
+            return base;
+        }
+
+        [[nodiscard]] std::optional<std::wstring> resolve_default_user_config_path() noexcept
+        {
+            if (const auto user_profile = read_environment(kUserProfileEnv))
+            {
+                if (!user_profile->empty())
+                {
+                    return append_path_component(*user_profile, kDefaultUserConfigName);
+                }
+            }
+
+            if (const auto home = read_environment(kHomeEnv))
+            {
+                if (!home->empty())
+                {
+                    return append_path_component(*home, kDefaultUserConfigName);
+                }
+            }
+
+            const auto home_drive = read_environment(kHomeDriveEnv);
+            const auto home_path = read_environment(kHomePathEnv);
+            if (home_drive && home_path)
+            {
+                std::wstring combined;
+                try
+                {
+                    combined.reserve(home_drive->size() + home_path->size());
+                    combined.append(*home_drive);
+                    combined.append(*home_path);
+                }
+                catch (...)
+                {
+                    return std::nullopt;
+                }
+
+                if (!combined.empty())
+                {
+                    return append_path_component(std::move(combined), kDefaultUserConfigName);
+                }
+            }
+
+            return std::nullopt;
+        }
+
+        [[nodiscard]] bool is_missing_file_error(const DWORD error) noexcept
+        {
+            return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+        }
+
+        [[nodiscard]] std::expected<void, ConfigError> load_config_file_into(
+            AppConfig& config,
+            const std::wstring& config_path,
+            const bool allow_missing_file) noexcept
+        {
+            auto file_text = read_config_file(config_path);
+            if (!file_text)
+            {
+                if (allow_missing_file && is_missing_file_error(file_text.error().win32_error))
+                {
+                    return {};
+                }
+
+                return std::unexpected(file_text.error());
+            }
+
+            auto parsed = ConfigLoader::parse_text(file_text.value());
+            if (!parsed)
+            {
+                return std::unexpected(parsed.error());
+            }
+
+            config = std::move(parsed.value());
+            return {};
+        }
+
         void apply_key_value(AppConfig& config, std::wstring key, std::wstring value)
         {
             key = trim(std::move(key));
@@ -215,6 +311,12 @@ namespace oc::config
             if (key == L"log_file")
             {
                 config.log_file_path = std::move(value);
+                config.enable_file_logging = !config.log_file_path.empty();
+                return;
+            }
+            if (key == L"enable_file_logging" || key == L"file_logging")
+            {
+                config.enable_file_logging = parse_bool(value);
                 return;
             }
             if (key == L"debug_sink")
@@ -260,6 +362,11 @@ namespace oc::config
             if (const auto value = read_environment(kLogFileEnv))
             {
                 config.log_file_path = *value;
+                config.enable_file_logging = !config.log_file_path.empty();
+            }
+            if (const auto value = read_environment(kEnableFileLoggingEnv))
+            {
+                config.enable_file_logging = parse_bool(*value);
             }
             if (const auto value = read_environment(kDebugSinkEnv))
             {
@@ -288,23 +395,24 @@ namespace oc::config
     {
         AppConfig config{};
 
-        // Optional config file bootstrap:
-        // - load baseline values from OPENCONSOLE_NEW_CONFIG if present
-        // - then apply env var overrides for runtime control in CI/scripts
+        // Startup bootstrap order:
+        // 1) Optional per-user baseline file: ~/.conhost (best-effort, missing file is ignored).
+        // 2) Optional explicit file from OPENCONSOLE_NEW_CONFIG (strict, errors are surfaced).
+        // 3) Environment overrides for CI/runtime control.
+        if (const auto user_config_path = resolve_default_user_config_path())
+        {
+            if (auto loaded = load_config_file_into(config, *user_config_path, true); !loaded)
+            {
+                return std::unexpected(loaded.error());
+            }
+        }
+
         if (const auto config_path = read_environment(kConfigPathEnv))
         {
-            auto file_text = read_config_file(*config_path);
-            if (!file_text)
+            if (auto loaded = load_config_file_into(config, *config_path, false); !loaded)
             {
-                return std::unexpected(file_text.error());
+                return std::unexpected(loaded.error());
             }
-
-            auto parsed = parse_text(file_text.value());
-            if (!parsed)
-            {
-                return std::unexpected(parsed.error());
-            }
-            config = std::move(parsed.value());
         }
 
         apply_environment_overrides(config);

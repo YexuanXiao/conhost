@@ -193,6 +193,10 @@ namespace oc::runtime
                     {
                         context->logger->log(logging::LogLevel::debug, L"Host signal pipe read failed (error={})", error);
                     }
+                    else if (context->logger != nullptr)
+                    {
+                        context->logger->log(logging::LogLevel::info, L"Host signal pipe disconnected (error={})", error);
+                    }
 
                     context->target->signal_pipe_disconnected();
                     return 0;
@@ -222,6 +226,13 @@ namespace oc::runtime
                         return 0;
                     }
 
+                    if (context->logger != nullptr)
+                    {
+                        context->logger->log(
+                            logging::LogLevel::debug,
+                            L"Host signal packet: notify_app(pid={})",
+                            payload->processId);
+                    }
                     context->target->notify_console_application(payload->processId);
                     break;
                 }
@@ -246,6 +257,14 @@ namespace oc::runtime
                         return 0;
                     }
 
+                    if (context->logger != nullptr)
+                    {
+                        context->logger->log(
+                            logging::LogLevel::debug,
+                            L"Host signal packet: set_foreground(pid={}, is_foreground={})",
+                            payload->processId,
+                            payload->isForeground ? 1 : 0);
+                    }
                     context->target->set_foreground(payload->processId, payload->isForeground);
                     break;
                 }
@@ -270,6 +289,15 @@ namespace oc::runtime
                         return 0;
                     }
 
+                    if (context->logger != nullptr)
+                    {
+                        context->logger->log(
+                            logging::LogLevel::debug,
+                            L"Host signal packet: end_task(pid={}, event={}, flags={})",
+                            payload->processId,
+                            payload->eventType,
+                            payload->ctrlFlags);
+                    }
                     context->target->end_task(payload->processId, payload->eventType, payload->ctrlFlags);
                     break;
                 }
