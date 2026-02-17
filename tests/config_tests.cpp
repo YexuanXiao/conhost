@@ -228,8 +228,9 @@ namespace
             L"log_level=debug\n"
             L"locale=zh-CN\n"
             L"dry_run=true\n"
-            L"log_file=C:\\temp\\oc.log\n"
+            L"log_dir=C:\\temp\\logs\n"
             L"enable_file_logging=1\n"
+            L"break_on_start=true\n"
             L"debug_sink=0\n"
             L"prefer_pseudoconsole=0\n"
             L"allow_embedding_passthrough=0\n"
@@ -243,8 +244,9 @@ namespace
         return parsed->minimum_log_level == oc::logging::LogLevel::debug &&
                parsed->locale_override == L"zh-CN" &&
                parsed->dry_run &&
-               parsed->log_file_path == L"C:\\temp\\oc.log" &&
+               parsed->log_directory_path == L"C:\\temp\\logs" &&
                parsed->enable_file_logging &&
+               parsed->break_on_start &&
                !parsed->enable_debug_sink &&
                !parsed->prefer_pseudoconsole &&
                !parsed->allow_embedding_passthrough &&
@@ -263,7 +265,9 @@ namespace
         const ScopedEnvironmentVariable log_level(L"OPENCONSOLE_NEW_LOG_LEVEL", std::optional<std::wstring>(L"error"));
         const ScopedEnvironmentVariable dry_run(L"OPENCONSOLE_NEW_DRY_RUN", std::optional<std::wstring>(L"1"));
         const ScopedEnvironmentVariable locale(L"OPENCONSOLE_NEW_LOCALE", std::optional<std::wstring>(L"en-US"));
+        const ScopedEnvironmentVariable log_dir(L"OPENCONSOLE_NEW_LOG_DIR", std::optional<std::wstring>(L"C:\\temp\\logs"));
         const ScopedEnvironmentVariable enable_file_logging(L"OPENCONSOLE_NEW_ENABLE_FILE_LOGGING", std::optional<std::wstring>(L"1"));
+        const ScopedEnvironmentVariable break_on_start(L"OPENCONSOLE_NEW_BREAK_ON_START", std::optional<std::wstring>(L"1"));
         const ScopedEnvironmentVariable debug_sink(L"OPENCONSOLE_NEW_DEBUG_SINK", std::optional<std::wstring>(L"false"));
         const ScopedEnvironmentVariable prefer_pty(L"OPENCONSOLE_NEW_PREFER_PTY", std::optional<std::wstring>(L"0"));
         const ScopedEnvironmentVariable embedding_passthrough(L"OPENCONSOLE_NEW_ALLOW_EMBEDDING_PASSTHROUGH", std::optional<std::wstring>(L"0"));
@@ -280,7 +284,9 @@ namespace
         return loaded->minimum_log_level == oc::logging::LogLevel::error &&
                loaded->dry_run &&
                loaded->locale_override == L"en-US" &&
+               loaded->log_directory_path == L"C:\\temp\\logs" &&
                loaded->enable_file_logging &&
+               loaded->break_on_start &&
                !loaded->enable_debug_sink &&
                !loaded->prefer_pseudoconsole &&
                !loaded->allow_embedding_passthrough &&

@@ -880,7 +880,7 @@ namespace
         const std::wstring log_path = join_path(build_dir, L"oc_new_process_integration.log");
         (void)::DeleteFileW(log_path.c_str());
         const ScopedEnvironmentVariable log_level(L"OPENCONSOLE_NEW_LOG_LEVEL", L"debug");
-        const ScopedEnvironmentVariable log_file(L"OPENCONSOLE_NEW_LOG_FILE", log_path);
+        const ScopedEnvironmentVariable log_dir(L"OPENCONSOLE_NEW_LOG_DIR", build_dir);
 
         auto captured = run_process_capture_output(application, cmd, std::nullopt, 30'000);
         if (!captured)
@@ -928,7 +928,7 @@ namespace
         const std::wstring log_path = join_path(build_dir, L"oc_new_process_integration.log");
         (void)::DeleteFileW(log_path.c_str());
         const ScopedEnvironmentVariable log_level(L"OPENCONSOLE_NEW_LOG_LEVEL", L"debug");
-        const ScopedEnvironmentVariable log_file(L"OPENCONSOLE_NEW_LOG_FILE", log_path);
+        const ScopedEnvironmentVariable log_dir(L"OPENCONSOLE_NEW_LOG_DIR", build_dir);
 
         constexpr std::string_view input = "abc\r\n";
         auto captured = run_process_capture_output(application, cmd, input, 30'000);
@@ -1007,7 +1007,7 @@ namespace
         const std::wstring log_path = join_path(build_dir, L"oc_new_condrv_process_integration.log");
         (void)::DeleteFileW(log_path.c_str());
         const ScopedEnvironmentVariable log_level(L"OPENCONSOLE_NEW_LOG_LEVEL", L"debug");
-        const ScopedEnvironmentVariable log_file(L"OPENCONSOLE_NEW_LOG_FILE", log_path);
+        const ScopedEnvironmentVariable log_dir(L"OPENCONSOLE_NEW_LOG_DIR", build_dir);
 
         const auto server_handle_value = static_cast<unsigned long long>(condrv_handles->server.view().as_uintptr());
         wchar_t server_handle_text[32]{};
@@ -1345,7 +1345,7 @@ namespace
         const std::wstring log_path = join_path(build_dir, L"oc_new_condrv_process_integration_input_events.log");
         (void)::DeleteFileW(log_path.c_str());
         const ScopedEnvironmentVariable log_level(L"OPENCONSOLE_NEW_LOG_LEVEL", L"debug");
-        const ScopedEnvironmentVariable log_file(L"OPENCONSOLE_NEW_LOG_FILE", log_path);
+        const ScopedEnvironmentVariable log_dir(L"OPENCONSOLE_NEW_LOG_DIR", build_dir);
 
         const auto server_handle_value = static_cast<unsigned long long>(condrv_handles->server.view().as_uintptr());
         wchar_t server_handle_text[32]{};

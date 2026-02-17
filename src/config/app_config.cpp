@@ -23,8 +23,10 @@ namespace oc::config
         constexpr std::wstring_view kLocaleEnv = L"OPENCONSOLE_NEW_LOCALE";
         constexpr std::wstring_view kDryRunEnv = L"OPENCONSOLE_NEW_DRY_RUN";
         constexpr std::wstring_view kLogLevelEnv = L"OPENCONSOLE_NEW_LOG_LEVEL";
-        constexpr std::wstring_view kLogFileEnv = L"OPENCONSOLE_NEW_LOG_FILE";
+        constexpr std::wstring_view kLogDirEnv = L"OPENCONSOLE_NEW_LOG_DIR";
+        constexpr std::wstring_view kLegacyLogFileEnv = L"OPENCONSOLE_NEW_LOG_FILE";
         constexpr std::wstring_view kEnableFileLoggingEnv = L"OPENCONSOLE_NEW_ENABLE_FILE_LOGGING";
+        constexpr std::wstring_view kBreakOnStartEnv = L"OPENCONSOLE_NEW_BREAK_ON_START";
         constexpr std::wstring_view kDebugSinkEnv = L"OPENCONSOLE_NEW_DEBUG_SINK";
         constexpr std::wstring_view kPreferPtyEnv = L"OPENCONSOLE_NEW_PREFER_PTY";
         constexpr std::wstring_view kEmbeddingPassthroughEnv = L"OPENCONSOLE_NEW_ALLOW_EMBEDDING_PASSTHROUGH";
@@ -214,6 +216,23 @@ namespace oc::config
             return base;
         }
 
+        [[nodiscard]] std::wstring directory_from_path(std::wstring value) noexcept
+        {
+            value = trim(std::move(value));
+            if (value.empty())
+            {
+                return {};
+            }
+
+            const size_t separator = value.find_last_of(L"\\/");
+            if (separator == std::wstring::npos)
+            {
+                return {};
+            }
+
+            return value.substr(0, separator);
+        }
+
         [[nodiscard]] std::optional<std::wstring> resolve_default_user_config_path() noexcept
         {
             if (const auto user_profile = read_environment(kUserProfileEnv))
@@ -308,15 +327,20 @@ namespace oc::config
                 config.minimum_log_level = parse_log_level(value);
                 return;
             }
-            if (key == L"log_file")
+            if (key == L"log_dir")
             {
-                config.log_file_path = std::move(value);
-                config.enable_file_logging = !config.log_file_path.empty();
+                config.log_directory_path = std::move(value);
+                config.enable_file_logging = !config.log_directory_path.empty();
                 return;
             }
             if (key == L"enable_file_logging" || key == L"file_logging")
             {
                 config.enable_file_logging = parse_bool(value);
+                return;
+            }
+            if (key == L"break_on_start")
+            {
+                config.break_on_start = parse_bool(value);
                 return;
             }
             if (key == L"debug_sink")
@@ -359,14 +383,23 @@ namespace oc::config
             {
                 config.minimum_log_level = parse_log_level(*value);
             }
-            if (const auto value = read_environment(kLogFileEnv))
+            if (const auto value = read_environment(kLogDirEnv))
             {
-                config.log_file_path = *value;
-                config.enable_file_logging = !config.log_file_path.empty();
+                config.log_directory_path = trim(*value);
+                config.enable_file_logging = !config.log_directory_path.empty();
+            }
+            else if (const auto value = read_environment(kLegacyLogFileEnv))
+            {
+                config.log_directory_path = directory_from_path(*value);
+                config.enable_file_logging = !config.log_directory_path.empty();
             }
             if (const auto value = read_environment(kEnableFileLoggingEnv))
             {
                 config.enable_file_logging = parse_bool(*value);
+            }
+            if (const auto value = read_environment(kBreakOnStartEnv))
+            {
+                config.break_on_start = parse_bool(*value);
             }
             if (const auto value = read_environment(kDebugSinkEnv))
             {

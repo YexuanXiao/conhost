@@ -26,7 +26,8 @@ Key runtime configuration environment variables:
 - `OPENCONSOLE_NEW_CONFIG`: optional config file path.
 - `OPENCONSOLE_NEW_LOG_LEVEL`: `trace|debug|info|warning|error`.
 - `OPENCONSOLE_NEW_ENABLE_FILE_LOGGING`: `1` to enable file logs (`0` default).
-- `OPENCONSOLE_NEW_LOG_FILE`: optional explicit log file path. If omitted and file logging is enabled, defaults to `%TEMP%\\console\\console_<pid>_<process_start_filetime>.log` (falls back to `%TMP%` when `%TEMP%` is unset).
+- `OPENCONSOLE_NEW_LOG_DIR`: optional log directory. If omitted and file logging is enabled, defaults to `%TEMP%\\console` (falls back to `%TMP%\\console` when `%TEMP%` is unset). Log filename is fixed to `console_<pid>_<process_start_filetime>.log`.
+- `OPENCONSOLE_NEW_BREAK_ON_START`: `1` to wait for a debugger on startup, then break into it before normal execution continues.
 - `OPENCONSOLE_NEW_PREFER_PTY`: `1` (default) or `0`.
 - `OPENCONSOLE_NEW_ALLOW_EMBEDDING_PASSTHROUGH`: `1` (default) or `0`.
 - `OPENCONSOLE_NEW_ENABLE_LEGACY_PATH`: `1` (default) or `0`.

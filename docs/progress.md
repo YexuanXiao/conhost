@@ -13,9 +13,15 @@
   - completions are now submitted via the completion input parameter on the next `IOCTL_CONDRV_READ_IO` call, keeping the message alive until completion submission so completion write buffers remain valid.
 - Added default file-log path behavior with opt-in enablement:
   - file logging is now disabled by default (`enable_file_logging=0` / `OPENCONSOLE_NEW_ENABLE_FILE_LOGGING=0`).
-  - when enabled without an explicit path, logs are written to `%TEMP%\\console\\<pid>_<process_start_filetime>.log` (fallback `%TMP%`).
+  - when enabled without an explicit path, logs are written to `%TEMP%\\console\\console_<pid>_<process_start_filetime>.log` (fallback `%TMP%`).
   - startup logs now include PID + full command line.
   - runtime logs now explicitly record interaction operations/results for external process launches and default-terminal host-signal/delegation paths.
+- Changed logging configuration from file path to directory path:
+  - replaced config key `log_file` with `log_dir` and environment override `OPENCONSOLE_NEW_LOG_DIR`.
+  - log filename is now fixed (`console_<pid>_<process_start_filetime>.log`) and cannot be customized.
+- Added startup debugger hold option:
+  - added `break_on_start` / `OPENCONSOLE_NEW_BREAK_ON_START`.
+  - when enabled, startup waits in 1-second intervals for a debugger to attach, then raises `DebugBreak()`; execution continues when the debugger resumes.
 
 ## 2026-02-16
 - Implemented VT insert/replace mode (IRM, `CSI 4 h` / `CSI 4 l`) for printable output when `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is enabled:

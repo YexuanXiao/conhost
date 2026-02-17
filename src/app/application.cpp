@@ -14,6 +14,7 @@
 
 #include <Windows.h>
 
+#include <expected>
 #include <memory>
 #include <string>
 
@@ -49,6 +50,21 @@ namespace oc::app
             }
             return ::GetFileType(handle.get()) == FILE_TYPE_PIPE;
         }
+
+        void maybe_break_on_start(const config::AppConfig& config) noexcept
+        {
+            if (!config.break_on_start)
+            {
+                return;
+            }
+
+            while (::IsDebuggerPresent() == FALSE)
+            {
+                ::Sleep(1'000);
+            }
+
+            ::DebugBreak();
+        }
     }
 
     int Application::run()
@@ -68,6 +84,7 @@ namespace oc::app
         }
 
         config::AppConfig config = std::move(config_result.value());
+        maybe_break_on_start(config);
         std::wstring locale = config.locale_override.empty() ? localization::Localizer::detect_user_locale() : config.locale_override;
         localization::Localizer localizer(std::move(locale));
 
@@ -78,30 +95,23 @@ namespace oc::app
         }
         if (config.enable_file_logging)
         {
-            std::wstring file_log_path = config.log_file_path;
-            if (file_log_path.empty())
+            std::expected<std::wstring, DWORD> resolved_path = std::unexpected(ERROR_INVALID_PARAMETER);
+            if (config.log_directory_path.empty())
             {
-                auto default_path = logging::FileLogSink::resolve_default_log_path();
-                if (default_path)
-                {
-                    file_log_path = std::move(default_path.value());
-                }
-                else
-                {
-                    logger.log(
-                        logging::LogLevel::warning,
-                        L"File logging disabled; default path resolution failed with error={}",
-                        default_path.error());
-                }
+                resolved_path = logging::FileLogSink::resolve_default_log_path();
+            }
+            else
+            {
+                resolved_path = logging::FileLogSink::resolve_log_path(config.log_directory_path);
             }
 
-            if (!file_log_path.empty())
+            if (resolved_path)
             {
-                auto file_sink = logging::FileLogSink::create(file_log_path);
+                auto file_sink = logging::FileLogSink::create(resolved_path.value());
                 if (file_sink)
                 {
                     logger.add_sink(file_sink.value());
-                    logger.log(logging::LogLevel::info, L"File logging enabled at {}", file_log_path);
+                    logger.log(logging::LogLevel::info, L"File logging enabled at {}", resolved_path.value());
                 }
                 else
                 {
@@ -110,7 +120,10 @@ namespace oc::app
             }
             else
             {
-                logger.log(logging::LogLevel::warning, L"File logging disabled; no usable log path");
+                logger.log(
+                    logging::LogLevel::warning,
+                    L"File logging disabled; path resolution failed with error={}",
+                    resolved_path.error());
             }
         }
 

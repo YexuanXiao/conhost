@@ -121,6 +121,44 @@ namespace oc::logging
         return std::shared_ptr<FileLogSink>(new FileLogSink(std::move(file)));
     }
 
+    std::expected<std::wstring, DWORD> FileLogSink::resolve_log_path(std::wstring directory_path) noexcept
+    {
+        if (directory_path.empty())
+        {
+            return std::unexpected(ERROR_INVALID_PARAMETER);
+        }
+
+        if (auto ensured = ensure_directory_exists(directory_path); !ensured)
+        {
+            return std::unexpected(ensured.error());
+        }
+
+        auto start_time = query_process_start_time();
+        if (!start_time)
+        {
+            return std::unexpected(start_time.error());
+        }
+
+        std::wstring file_name;
+        std::wstring path;
+        try
+        {
+            file_name.append(L"console_");
+            file_name.append(std::to_wstring(::GetCurrentProcessId()));
+            file_name.push_back(L'_');
+            file_name.append(std::to_wstring(*start_time));
+            file_name.append(L".log");
+
+            path = append_path_component(std::move(directory_path), file_name);
+        }
+        catch (...)
+        {
+            return std::unexpected(ERROR_OUTOFMEMORY);
+        }
+
+        return path;
+    }
+
     std::expected<std::wstring, DWORD> FileLogSink::resolve_default_log_path() noexcept
     {
         std::optional<std::wstring> temp_root = read_environment(L"TEMP");
@@ -143,35 +181,7 @@ namespace oc::logging
             return std::unexpected(ERROR_OUTOFMEMORY);
         }
 
-        if (auto ensured = ensure_directory_exists(console_directory); !ensured)
-        {
-            return std::unexpected(ensured.error());
-        }
-
-        auto start_time = query_process_start_time();
-        if (!start_time)
-        {
-            return std::unexpected(start_time.error());
-        }
-
-        std::wstring file_name;
-        std::wstring path;
-        try
-        {
-            file_name.append(L"console_");
-            file_name.append(std::to_wstring(::GetCurrentProcessId()));
-            file_name.push_back(L'_');
-            file_name.append(std::to_wstring(*start_time));
-            file_name.append(L".log");
-
-            path = append_path_component(std::move(console_directory), file_name);
-        }
-        catch (...)
-        {
-            return std::unexpected(ERROR_OUTOFMEMORY);
-        }
-
-        return path;
+        return resolve_log_path(std::move(console_directory));
     }
 
     void FileLogSink::write(const std::wstring_view line) noexcept

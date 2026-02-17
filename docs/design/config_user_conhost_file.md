@@ -52,17 +52,28 @@ Supported keys are handled by `apply_key_value(...)` in `new/src/config/app_conf
 Logging-specific keys:
 
 - `enable_file_logging=0|1` (default `0`)
-- `log_file=<path>` (also implicitly enables file logging when non-empty)
+- `log_dir=<path>` (also implicitly enables file logging when non-empty)
+- `break_on_start=0|1` (default `0`)
 
 Environment overrides:
 
 - `OPENCONSOLE_NEW_ENABLE_FILE_LOGGING`
-- `OPENCONSOLE_NEW_LOG_FILE`
+- `OPENCONSOLE_NEW_LOG_DIR`
+- `OPENCONSOLE_NEW_BREAK_ON_START`
 
-When file logging is enabled and `log_file` is empty, runtime chooses:
+When file logging is enabled and `log_dir` is empty, runtime chooses:
 
 - `%TEMP%\\console\\console_<pid>_<process_start_filetime>.log`
 - falls back to `%TMP%` when `%TEMP%` is unavailable.
+
+The log filename is not configurable. Only the directory can be configured.
+
+Startup debug hold behavior:
+
+- when `break_on_start` is enabled, startup loops until `IsDebuggerPresent()` is true.
+- while no debugger is attached, the process sleeps for 1 second per poll.
+- once attached, `DebugBreak()` is raised so the debugger suspends execution.
+- after the debugger continues execution, normal startup resumes.
 
 ## Tests
 

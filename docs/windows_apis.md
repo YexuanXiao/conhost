@@ -89,6 +89,8 @@ This document lists Windows APIs used by the reimplementation in `new/`.
 
 ## Diagnostics and Logging
 - `OutputDebugStringW`
+- `IsDebuggerPresent`
+- `DebugBreak`
 - `GetLocalTime`
 - `GetLastError`
 - `GetCurrentProcessId`

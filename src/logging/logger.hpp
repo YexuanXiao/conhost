@@ -32,6 +32,7 @@ namespace oc::logging
     {
     public:
         [[nodiscard]] static std::expected<std::shared_ptr<FileLogSink>, DWORD> create(std::wstring path) noexcept;
+        [[nodiscard]] static std::expected<std::wstring, DWORD> resolve_log_path(std::wstring directory_path) noexcept;
         [[nodiscard]] static std::expected<std::wstring, DWORD> resolve_default_log_path() noexcept;
         void write(std::wstring_view line) noexcept override;
 
