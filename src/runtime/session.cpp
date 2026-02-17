@@ -4,10 +4,12 @@
 #include "condrv/condrv_server.hpp"
 #include "core/assert.hpp"
 #include "core/handle_view.hpp"
+#include "core/host_signals.hpp"
 #include "core/unique_handle.hpp"
 #include "core/win32_handle.hpp"
 #include "core/win32_wait.hpp"
 #include "renderer/window_host.hpp"
+#include "runtime/host_signal_input_thread.hpp"
 #include "runtime/key_input_encoder.hpp"
 #include "runtime/server_handle_validator.hpp"
 
@@ -15,9 +17,11 @@
 
 #include <Windows.h>
 #include <objbase.h>
+#include <winternl.h>
 
 #include <array>
 #include <cstddef>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -44,6 +48,328 @@ namespace oc::runtime
         {
             const DWORD code = static_cast<DWORD>(HRESULT_CODE(hr));
             return code == 0 ? ERROR_GEN_FAILURE : code;
+        }
+
+        // Private `user32!ConsoleControl` helper used to honor host-signal requests
+        // coming from a delegated/default terminal.
+        //
+        // openconsole_new (in `--server` startup mode) reads the host-signal pipe and
+        // must perform privileged console operations (like EndTask) on behalf of the
+        // delegated UI host. The inbox conhost does the same.
+        enum class ConsoleControlCommand : DWORD
+        {
+            reserved1 = 0,
+            notify_console_application = 1,
+            reserved2 = 2,
+            set_caret_info = 3,
+            reserved3 = 4,
+            set_foreground = 5,
+            set_window_owner = 6,
+            end_task = 7,
+        };
+
+        struct ConsoleProcessInfo final
+        {
+            DWORD process_id{};
+            DWORD flags{};
+        };
+
+        struct ConsoleEndTask final
+        {
+            HANDLE process_id{};
+            HWND hwnd{};
+            ULONG console_event_code{};
+            ULONG console_flags{};
+        };
+
+        inline constexpr DWORD cpi_newprocesswindow = 0x0001u;
+
+        using ConsoleControlFn = NTSTATUS(WINAPI*)(DWORD command, void* information, DWORD length);
+        using RtlNtStatusToDosErrorFn = ULONG(WINAPI*)(NTSTATUS status);
+
+        [[nodiscard]] ConsoleControlFn resolve_console_control() noexcept
+        {
+            const HMODULE user32 = ::GetModuleHandleW(L"user32.dll");
+            if (user32 == nullptr)
+            {
+                return nullptr;
+            }
+
+            return reinterpret_cast<ConsoleControlFn>(::GetProcAddress(user32, "ConsoleControl"));
+        }
+
+        [[nodiscard]] RtlNtStatusToDosErrorFn resolve_rtl_nt_status_to_dos_error() noexcept
+        {
+            const HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+            if (ntdll == nullptr)
+            {
+                return nullptr;
+            }
+
+            return reinterpret_cast<RtlNtStatusToDosErrorFn>(::GetProcAddress(ntdll, "RtlNtStatusToDosError"));
+        }
+
+        [[nodiscard]] DWORD ntstatus_to_win32_error(const NTSTATUS status, const RtlNtStatusToDosErrorFn converter) noexcept
+        {
+            if (converter == nullptr)
+            {
+                return ERROR_GEN_FAILURE;
+            }
+
+            const DWORD error = static_cast<DWORD>(converter(status));
+            return error == 0 ? ERROR_GEN_FAILURE : error;
+        }
+
+        void notify_console_application_best_effort(
+            const ConsoleControlFn console_control,
+            const RtlNtStatusToDosErrorFn rtl_nt_status_to_dos_error,
+            logging::Logger& logger,
+            const DWORD process_id) noexcept
+        {
+            if (console_control == nullptr || process_id == 0)
+            {
+                return;
+            }
+
+            ConsoleProcessInfo info{};
+            info.process_id = process_id;
+            info.flags = cpi_newprocesswindow;
+
+            const NTSTATUS status = console_control(
+                static_cast<DWORD>(ConsoleControlCommand::notify_console_application),
+                &info,
+                static_cast<DWORD>(sizeof(info)));
+            if (status < 0)
+            {
+                const DWORD error = ntstatus_to_win32_error(status, rtl_nt_status_to_dos_error);
+                try
+                {
+                    logger.log(
+                        logging::LogLevel::debug,
+                        L"ConsoleControl(NotifyConsoleApplication, pid={}) failed (ntstatus=0x{:08X}, error={})",
+                        process_id,
+                        static_cast<unsigned>(status),
+                        error);
+                }
+                catch (...)
+                {
+                }
+            }
+        }
+
+        void end_task_best_effort(
+            const ConsoleControlFn console_control,
+            const RtlNtStatusToDosErrorFn rtl_nt_status_to_dos_error,
+            logging::Logger& logger,
+            const DWORD process_id,
+            const DWORD event_type,
+            const DWORD ctrl_flags) noexcept
+        {
+            if (process_id == 0)
+            {
+                return;
+            }
+
+            bool ended = false;
+            if (console_control != nullptr)
+            {
+                ConsoleEndTask params{};
+                params.process_id = reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(process_id));
+                params.hwnd = nullptr;
+                params.console_event_code = event_type;
+                params.console_flags = ctrl_flags;
+
+                const NTSTATUS status = console_control(
+                    static_cast<DWORD>(ConsoleControlCommand::end_task),
+                    &params,
+                    static_cast<DWORD>(sizeof(params)));
+                if (status >= 0)
+                {
+                    ended = true;
+                }
+                else
+                {
+                    const DWORD error = ntstatus_to_win32_error(status, rtl_nt_status_to_dos_error);
+                    try
+                    {
+                        logger.log(
+                            logging::LogLevel::debug,
+                            L"ConsoleControl(EndTask, pid={}) failed (ntstatus=0x{:08X}, error={}); falling back to TerminateProcess",
+                            process_id,
+                            static_cast<unsigned>(status),
+                            error);
+                    }
+                    catch (...)
+                    {
+                    }
+                }
+            }
+
+            if (!ended)
+            {
+                core::UniqueHandle process(::OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, process_id));
+                if (!process.valid())
+                {
+                    try
+                    {
+                        logger.log(
+                            logging::LogLevel::debug,
+                            L"OpenProcess(PROCESS_TERMINATE) failed for EndTask fallback (pid={}, error={})",
+                            process_id,
+                            ::GetLastError());
+                    }
+                    catch (...)
+                    {
+                    }
+                    return;
+                }
+
+                if (::TerminateProcess(process.get(), ERROR_CANCELLED) == FALSE)
+                {
+                    try
+                    {
+                        logger.log(
+                            logging::LogLevel::debug,
+                            L"TerminateProcess failed for EndTask fallback (pid={}, error={})",
+                            process_id,
+                            ::GetLastError());
+                    }
+                    catch (...)
+                    {
+                    }
+                }
+            }
+        }
+
+        struct NtdllApi final
+        {
+            using NtOpenFileFn = NTSTATUS(NTAPI*)(
+                PHANDLE file_handle,
+                ACCESS_MASK desired_access,
+                POBJECT_ATTRIBUTES object_attributes,
+                PIO_STATUS_BLOCK io_status_block,
+                ULONG share_access,
+                ULONG open_options);
+
+            using RtlNtStatusToDosErrorFn = ULONG(WINAPI*)(NTSTATUS status);
+
+            NtOpenFileFn nt_open_file{};
+            RtlNtStatusToDosErrorFn rtl_nt_status_to_dos_error{};
+        };
+
+        [[nodiscard]] std::expected<NtdllApi, SessionError> load_ntdll_api() noexcept
+        {
+            HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+            if (ntdll == nullptr)
+            {
+                return std::unexpected(SessionError{
+                    .context = L"GetModuleHandleW(ntdll.dll) failed",
+                    .win32_error = ::GetLastError(),
+                });
+            }
+
+            auto* const nt_open_file = reinterpret_cast<NtdllApi::NtOpenFileFn>(::GetProcAddress(ntdll, "NtOpenFile"));
+            auto* const rtl_nt_status_to_dos_error = reinterpret_cast<NtdllApi::RtlNtStatusToDosErrorFn>(::GetProcAddress(ntdll, "RtlNtStatusToDosError"));
+            if (nt_open_file == nullptr || rtl_nt_status_to_dos_error == nullptr)
+            {
+                return std::unexpected(SessionError{
+                    .context = L"GetProcAddress failed for NTDLL helpers",
+                    .win32_error = ::GetLastError(),
+                });
+            }
+
+            return NtdllApi{
+                .nt_open_file = nt_open_file,
+                .rtl_nt_status_to_dos_error = rtl_nt_status_to_dos_error,
+            };
+        }
+
+        [[nodiscard]] std::expected<core::UniqueHandle, SessionError> open_server_relative_file(
+            const NtdllApi& ntdll,
+            const core::HandleView server_handle,
+            const std::wstring_view child_name,
+            const ACCESS_MASK desired_access,
+            const ULONG open_options) noexcept
+        {
+            if (!server_handle)
+            {
+                return std::unexpected(SessionError{
+                    .context = L"Server handle was invalid while opening a server-relative path",
+                    .win32_error = ERROR_INVALID_HANDLE,
+                });
+            }
+
+            if (child_name.size() > (std::numeric_limits<USHORT>::max() / sizeof(wchar_t)))
+            {
+                return std::unexpected(SessionError{
+                    .context = L"Server-relative path was too long",
+                    .win32_error = ERROR_FILENAME_EXCED_RANGE,
+                });
+            }
+
+            std::wstring owned_child;
+            try
+            {
+                owned_child.assign(child_name);
+                owned_child.push_back(L'\0');
+            }
+            catch (...)
+            {
+                return std::unexpected(SessionError{
+                    .context = L"Failed to allocate server-relative path buffer",
+                    .win32_error = ERROR_OUTOFMEMORY,
+                });
+            }
+
+            UNICODE_STRING unicode_name{};
+            unicode_name.Buffer = owned_child.data();
+            unicode_name.Length = static_cast<USHORT>(child_name.size() * sizeof(wchar_t));
+            unicode_name.MaximumLength = static_cast<USHORT>(unicode_name.Length + sizeof(wchar_t));
+
+            OBJECT_ATTRIBUTES object_attributes{};
+            InitializeObjectAttributes(
+                &object_attributes,
+                &unicode_name,
+                OBJ_CASE_INSENSITIVE,
+                server_handle.get(),
+                nullptr);
+
+            IO_STATUS_BLOCK io_status{};
+            HANDLE opened = nullptr;
+            const NTSTATUS status = ntdll.nt_open_file(
+                &opened,
+                desired_access,
+                &object_attributes,
+                &io_status,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                open_options);
+            if (status < 0)
+            {
+                const DWORD win32_error = static_cast<DWORD>(ntdll.rtl_nt_status_to_dos_error(status));
+                return std::unexpected(SessionError{
+                    .context = L"NtOpenFile failed for server-relative path",
+                    .win32_error = win32_error == 0 ? ERROR_GEN_FAILURE : win32_error,
+                });
+            }
+
+            return core::UniqueHandle(opened);
+        }
+
+        [[nodiscard]] std::expected<core::UniqueHandle, SessionError> open_console_reference_handle(
+            const core::HandleView server_handle) noexcept
+        {
+            auto ntdll = load_ntdll_api();
+            if (!ntdll)
+            {
+                return std::unexpected(ntdll.error());
+            }
+
+            return open_server_relative_file(
+                *ntdll,
+                server_handle,
+                L"\\Reference",
+                GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE,
+                FILE_SYNCHRONOUS_IO_NONALERT);
         }
 
         class UniqueRegistryKey final
@@ -478,164 +804,6 @@ namespace oc::runtime
 
             return 0;
         }
-
-        struct HostSignalPipeDrainContext final
-        {
-            core::HandleView pipe{};
-        };
-
-        DWORD WINAPI host_signal_pipe_drain_thread_proc(void* param)
-        {
-            auto* context = static_cast<HostSignalPipeDrainContext*>(param);
-            if (context == nullptr || !context->pipe)
-            {
-                return 0;
-            }
-
-            std::array<std::byte, 256> buffer{};
-            for (;;)
-            {
-                DWORD read = 0;
-                if (::ReadFile(
-                        context->pipe.get(),
-                        buffer.data(),
-                        static_cast<DWORD>(buffer.size()),
-                        &read,
-                        nullptr) == FALSE)
-                {
-                    const DWORD error = ::GetLastError();
-                    if (error == ERROR_BROKEN_PIPE ||
-                        error == ERROR_PIPE_NOT_CONNECTED ||
-                        error == ERROR_NO_DATA ||
-                        error == ERROR_OPERATION_ABORTED ||
-                        error == ERROR_CANCELLED)
-                    {
-                        return 0;
-                    }
-
-                    return 0;
-                }
-
-                if (read == 0)
-                {
-                    return 0;
-                }
-            }
-        }
-
-        class HostSignalPipeDrain final
-        {
-        public:
-            HostSignalPipeDrain() noexcept = default;
-
-            ~HostSignalPipeDrain() noexcept
-            {
-                stop_and_join();
-            }
-
-            HostSignalPipeDrain(const HostSignalPipeDrain&) = delete;
-            HostSignalPipeDrain& operator=(const HostSignalPipeDrain&) = delete;
-
-            HostSignalPipeDrain(HostSignalPipeDrain&& other) noexcept :
-                _thread(std::move(other._thread)),
-                _pipe(std::move(other._pipe)),
-                _context(std::move(other._context))
-            {
-                other._context.reset();
-            }
-
-            HostSignalPipeDrain& operator=(HostSignalPipeDrain&& other) noexcept
-            {
-                if (this != &other)
-                {
-                    stop_and_join();
-                    _thread = std::move(other._thread);
-                    _pipe = std::move(other._pipe);
-                    _context = std::move(other._context);
-                    other._context.reset();
-                }
-                return *this;
-            }
-
-            [[nodiscard]] static std::expected<HostSignalPipeDrain, SessionError> start(const core::HandleView pipe_read_end) noexcept
-            {
-                if (!pipe_read_end)
-                {
-                    return std::unexpected(SessionError{
-                        .context = L"Host signal pipe read handle was invalid",
-                        .win32_error = ERROR_INVALID_HANDLE,
-                    });
-                }
-
-                auto duplicated_pipe = core::duplicate_handle_same_access(pipe_read_end, false);
-                if (!duplicated_pipe)
-                {
-                    return std::unexpected(SessionError{
-                        .context = L"DuplicateHandle failed for host signal pipe read handle",
-                        .win32_error = duplicated_pipe.error(),
-                    });
-                }
-
-                core::UniqueHandle owned_pipe = std::move(duplicated_pipe.value());
-
-                std::unique_ptr<HostSignalPipeDrainContext> context;
-                try
-                {
-                    context = std::make_unique<HostSignalPipeDrainContext>();
-                }
-                catch (...)
-                {
-                    return std::unexpected(SessionError{
-                        .context = L"Failed to allocate host signal pipe drain context",
-                        .win32_error = ERROR_OUTOFMEMORY,
-                    });
-                }
-                context->pipe = owned_pipe.view();
-
-                core::UniqueHandle thread(::CreateThread(
-                    nullptr,
-                    0,
-                    &host_signal_pipe_drain_thread_proc,
-                    context.get(),
-                    0,
-                    nullptr));
-                if (!thread.valid())
-                {
-                    return std::unexpected(SessionError{
-                        .context = L"CreateThread failed for host signal pipe drain",
-                        .win32_error = ::GetLastError(),
-                    });
-                }
-
-                HostSignalPipeDrain drain{};
-                drain._thread = std::move(thread);
-                drain._pipe = std::move(owned_pipe);
-                drain._context = std::move(context);
-                return drain;
-            }
-
-            void stop_and_join() noexcept
-            {
-                if (_thread.valid())
-                {
-                    if (_pipe.valid())
-                    {
-                        (void)::CancelIoEx(_pipe.get(), nullptr);
-                    }
-                    (void)::CancelSynchronousIo(_thread.get());
-                    (void)::WaitForSingleObject(_thread.get(), INFINITE);
-                    _thread.reset();
-                }
-
-                _context.reset();
-                _pipe.reset();
-            }
-
-        private:
-            core::UniqueHandle _thread;
-            core::UniqueHandle _pipe;
-            std::unique_ptr<HostSignalPipeDrainContext> _context;
-        };
 
         [[nodiscard]] std::expected<DWORD, SessionError> run_windowed_server(
             const SessionOptions& options,
@@ -1785,42 +1953,217 @@ namespace oc::runtime
                                                 {
                                                     logger.log(logging::LogLevel::info, L"Default-terminal delegation established; waiting for delegated host");
 
-                                                    auto signal_drain = HostSignalPipeDrain::start(signal_pipe_pair->read_end.view());
-                                                    if (!signal_drain)
+                                                    // The delegated host owns the input event after a successful handoff.
+                                                    input_available_event.reset();
+
+                                                    core::UniqueHandle reference_handle;
+                                                    if (auto reference = open_console_reference_handle(options.server_handle))
                                                     {
-                                                        logger.log(
-                                                            logging::LogLevel::warning,
-                                                            L"Host signal pipe drain thread creation failed; continuing without drain. context='{}', error={}",
-                                                            signal_drain.error().context,
-                                                            signal_drain.error().win32_error);
+                                                        reference_handle = std::move(reference.value());
                                                     }
                                                     else
                                                     {
-                                                        // The drain thread owns its own duplicated pipe handle.
+                                                        logger.log(
+                                                            logging::LogLevel::debug,
+                                                            L"Default-terminal delegation could not open console reference handle; wait may rely on delegated host process lifetime. context='{}', error={}",
+                                                            reference.error().context,
+                                                            reference.error().win32_error);
+                                                    }
+
+                                                    core::UniqueHandle client_process;
+                                                    const DWORD client_pid = attach.Process > std::numeric_limits<DWORD>::max()
+                                                        ? 0
+                                                        : static_cast<DWORD>(attach.Process);
+                                                    if (!reference_handle.valid())
+                                                    {
+                                                        if (client_pid != 0)
+                                                        {
+                                                            client_process = core::UniqueHandle(::OpenProcess(SYNCHRONIZE, FALSE, client_pid));
+                                                            if (!client_process.valid())
+                                                            {
+                                                                logger.log(
+                                                                    logging::LogLevel::debug,
+                                                                    L"Default-terminal delegation could not open client process (pid={}); wait may rely on delegated host process lifetime. error={}",
+                                                                    client_pid,
+                                                                    ::GetLastError());
+                                                            }
+                                                        }
+                                                    }
+
+                                                    struct DelegatedHostSignalTarget final : HostSignalTarget
+                                                    {
+                                                        logging::Logger& logger;
+                                                        ConsoleControlFn console_control{};
+                                                        RtlNtStatusToDosErrorFn rtl_nt_status_to_dos_error{};
+                                                        DWORD fallback_pid{};
+
+                                                        explicit DelegatedHostSignalTarget(
+                                                            logging::Logger& logger_ref,
+                                                            const ConsoleControlFn console_control_ref,
+                                                            const RtlNtStatusToDosErrorFn rtl_nt_status_to_dos_error_ref,
+                                                            const DWORD fallback_pid_ref) noexcept :
+                                                            logger(logger_ref),
+                                                            console_control(console_control_ref),
+                                                            rtl_nt_status_to_dos_error(rtl_nt_status_to_dos_error_ref),
+                                                            fallback_pid(fallback_pid_ref)
+                                                        {
+                                                        }
+
+                                                        void notify_console_application(const DWORD process_id) noexcept override
+                                                        {
+                                                            notify_console_application_best_effort(
+                                                                console_control,
+                                                                rtl_nt_status_to_dos_error,
+                                                                logger,
+                                                                process_id);
+                                                        }
+
+                                                        void set_foreground(const DWORD /*process_handle_value*/, const bool /*is_foreground*/) noexcept override
+                                                        {
+                                                            // GH#13211 parity: upstream ignores this (legacy callers only).
+                                                        }
+
+                                                        void end_task(const DWORD process_id, const DWORD event_type, const DWORD ctrl_flags) noexcept override
+                                                        {
+                                                            end_task_best_effort(
+                                                                console_control,
+                                                                rtl_nt_status_to_dos_error,
+                                                                logger,
+                                                                process_id,
+                                                                event_type,
+                                                                ctrl_flags);
+                                                        }
+
+                                                        void signal_pipe_disconnected() noexcept override
+                                                        {
+                                                            if (fallback_pid == 0)
+                                                            {
+                                                                return;
+                                                            }
+
+                                                            end_task_best_effort(
+                                                                console_control,
+                                                                rtl_nt_status_to_dos_error,
+                                                                logger,
+                                                                fallback_pid,
+                                                                CTRL_CLOSE_EVENT,
+                                                                core::console_ctrl_close_flag);
+                                                        }
+                                                    };
+
+                                                    DelegatedHostSignalTarget signal_target(
+                                                        logger,
+                                                        resolve_console_control(),
+                                                        resolve_rtl_nt_status_to_dos_error(),
+                                                        client_pid);
+
+                                                    auto signal_input = HostSignalInputThread::start(
+                                                        signal_pipe_pair->read_end.view(),
+                                                        signal_target,
+                                                        &logger);
+                                                    if (!signal_input)
+                                                    {
+                                                        logger.log(
+                                                            logging::LogLevel::warning,
+                                                            L"Host signal input thread creation failed; continuing without host-signal handling. context='{}', error={}",
+                                                            signal_input.error().context,
+                                                            signal_input.error().win32_error);
+                                                    }
+                                                    else
+                                                    {
+                                                        // The host signal thread owns its own duplicated pipe handle.
                                                         signal_pipe_pair->read_end.reset();
                                                     }
+
                                                     // Allow the delegated host to observe pipe closure when it exits.
                                                     signal_pipe_pair->write_end.reset();
 
-                                                    const DWORD wait_result = ::WaitForSingleObject(delegated_process->get(), INFINITE);
-                                                    if (wait_result != WAIT_OBJECT_0)
+                                                    core::HandleView host_signal_thread_handle{};
+                                                    if (signal_input)
                                                     {
-                                                        return std::unexpected(SessionError{
-                                                            .context = L"WaitForSingleObject failed for delegated host process",
-                                                            .win32_error = ::GetLastError(),
-                                                        });
+                                                        host_signal_thread_handle = signal_input.value().thread_handle();
                                                     }
 
-                                                    DWORD exit_code = 0;
-                                                    if (::GetExitCodeProcess(delegated_process->get(), &exit_code) == FALSE)
+                                                    std::array<HANDLE, 4> wait_handles{};
+                                                    wait_handles[0] = delegated_process->get();
+                                                    DWORD handle_count = 1;
+                                                    DWORD reference_index = std::numeric_limits<DWORD>::max();
+                                                    DWORD host_signal_thread_index = std::numeric_limits<DWORD>::max();
+                                                    DWORD client_index = std::numeric_limits<DWORD>::max();
+
+                                                    if (reference_handle.valid())
                                                     {
-                                                        return std::unexpected(SessionError{
-                                                            .context = L"GetExitCodeProcess failed for delegated host process",
-                                                            .win32_error = ::GetLastError(),
-                                                        });
+                                                        reference_index = handle_count;
+                                                        wait_handles[handle_count] = reference_handle.get();
+                                                        ++handle_count;
                                                     }
 
-                                                    return exit_code;
+                                                    if (host_signal_thread_handle)
+                                                    {
+                                                        host_signal_thread_index = handle_count;
+                                                        wait_handles[handle_count] = host_signal_thread_handle.get();
+                                                        ++handle_count;
+                                                    }
+
+                                                    if (client_process.valid() && handle_count < wait_handles.size())
+                                                    {
+                                                        client_index = handle_count;
+                                                        wait_handles[handle_count] = client_process.get();
+                                                        ++handle_count;
+                                                    }
+
+                                                    const DWORD wait_result = ::WaitForMultipleObjects(
+                                                        handle_count,
+                                                        wait_handles.data(),
+                                                        FALSE,
+                                                        INFINITE);
+
+                                                    if (wait_result == WAIT_OBJECT_0)
+                                                    {
+                                                        DWORD exit_code = 0;
+                                                        if (::GetExitCodeProcess(delegated_process->get(), &exit_code) == FALSE)
+                                                        {
+                                                            return std::unexpected(SessionError{
+                                                                .context = L"GetExitCodeProcess failed for delegated host process",
+                                                                .win32_error = ::GetLastError(),
+                                                            });
+                                                        }
+
+                                                        return exit_code;
+                                                    }
+
+                                                    if (reference_index != std::numeric_limits<DWORD>::max() &&
+                                                        wait_result == WAIT_OBJECT_0 + reference_index)
+                                                    {
+                                                        logger.log(
+                                                            logging::LogLevel::info,
+                                                            L"Console reference handle signaled; exiting delegated startup wait");
+                                                        return DWORD{ 0 };
+                                                    }
+
+                                                    if (host_signal_thread_index != std::numeric_limits<DWORD>::max() &&
+                                                        wait_result == WAIT_OBJECT_0 + host_signal_thread_index)
+                                                    {
+                                                        logger.log(
+                                                            logging::LogLevel::info,
+                                                            L"Host signal pipe disconnected; exiting delegated startup wait");
+                                                        return DWORD{ 0 };
+                                                    }
+
+                                                    if (client_index != std::numeric_limits<DWORD>::max() &&
+                                                        wait_result == WAIT_OBJECT_0 + client_index)
+                                                    {
+                                                        logger.log(
+                                                            logging::LogLevel::info,
+                                                            L"Client process exited; exiting delegated startup wait");
+                                                        return DWORD{ 0 };
+                                                    }
+
+                                                    const DWORD wait_error = (wait_result == WAIT_FAILED) ? ::GetLastError() : ERROR_GEN_FAILURE;
+                                                    return std::unexpected(SessionError{
+                                                        .context = L"WaitForMultipleObjects failed for delegated host wait set",
+                                                        .win32_error = wait_error,
+                                                    });
                                                 }
 
                                                 logger.log(

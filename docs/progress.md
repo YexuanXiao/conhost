@@ -3,7 +3,11 @@
 ## 2026-02-17
 - Fixed default-terminal delegation for classic windowed `--server` startup:
   - when started as `--server` in non-headless, non-ConPTY mode, `runtime::Session` now probes `HKCU\\Console\\%%Startup\\DelegationConsole` and calls `IConsoleHandoff::EstablishHandoff`.
-  - on successful handoff, `openconsole_new` does not create a classic window; it waits for the delegated host to exit.
+  - on successful handoff, `openconsole_new` does not create a classic window; it waits for the delegated host to exit **or** for the ConDrv `\\Reference` handle to signal (so the stub exits when the console session ends even if the delegated process is long-lived).
+- Implemented host-signal handling for delegated startup:
+  - the stub now runs `runtime::HostSignalInputThread` and honors `EndTask` requests from the delegated host.
+  - this fixes the case where closing the delegated/third-party terminal left the console client running headlessly, preventing `openconsole_new` from exiting.
+  - hardened `HostSignalInputThread::stop_and_join` to be non-blocking even if the delegated host keeps the signal pipe open (uses a stop event + `PeekNamedPipe` polling to avoid an uninterruptible `ReadFile`).
 - Hardened the ConDrv server completion path to eliminate intermittent `ERROR_OPERATION_ABORTED` (995) failures from `IOCTL_CONDRV_COMPLETE_IO`:
   - removed `IOCTL_CONDRV_COMPLETE_IO` from the hot path.
   - completions are now submitted via the completion input parameter on the next `IOCTL_CONDRV_READ_IO` call, keeping the message alive until completion submission so completion write buffers remain valid.

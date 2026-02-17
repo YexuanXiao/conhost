@@ -24,6 +24,7 @@ add_library(oc_new_core STATIC
     src/runtime/com_embedding_server.cpp
     src/runtime/launch_policy.cpp
     src/runtime/legacy_conhost.cpp
+    src/runtime/host_signal_input_thread.cpp
     src/runtime/session.cpp
     src/runtime/server_handle_validator.cpp
     src/runtime/startup_command.cpp
