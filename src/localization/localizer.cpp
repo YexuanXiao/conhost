@@ -25,7 +25,7 @@ namespace oc::localization
             switch (id)
             {
             case StringId::startup:
-                return L"OpenConsole 新实现启动";
+                return L"新实现启动";
             case StringId::parse_failed:
                 return L"命令行参数解析失败";
             case StringId::config_failed:
@@ -44,7 +44,7 @@ namespace oc::localization
         switch (id)
         {
         case StringId::startup:
-            return L"OpenConsole new runtime starting";
+            return L"New runtime starting";
         case StringId::parse_failed:
             return L"Command line parsing failed";
         case StringId::config_failed:
@@ -71,4 +71,3 @@ namespace oc::localization
         return std::wstring(locale_buffer, locale_buffer + size - 1);
     }
 }
-

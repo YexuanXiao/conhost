@@ -59,15 +59,15 @@ This document lists Windows APIs used by the reimplementation in `new/`.
 - `ResetEvent`
 - `SetFilePointerEx`
 - `GetFileType`
-- `GetModuleHandleW` (tests)
+- `GetModuleHandleW`
 - `LoadLibraryW` (tests)
 - `LoadLibraryExW`
 - `GetProcAddress`
 - `FreeLibrary`
 
-## NTDLL (Tests Only)
-- `NtOpenFile` (tests)
-- `RtlNtStatusToDosError` (tests)
+## NTDLL
+- `NtOpenFile`
+- `RtlNtStatusToDosError`
 
 ## Registry
 - `RegOpenKeyExW`

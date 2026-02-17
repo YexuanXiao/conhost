@@ -117,6 +117,13 @@ namespace oc::runtime
         inline constexpr DWORD cpi_newprocesswindow = 0x0001u;
 
         using ConsoleControlFn = NTSTATUS(WINAPI*)(DWORD command, void* information, DWORD length);
+        using NtOpenFileFn = NTSTATUS(NTAPI*)(
+            PHANDLE file_handle,
+            ACCESS_MASK desired_access,
+            POBJECT_ATTRIBUTES object_attributes,
+            PIO_STATUS_BLOCK io_status_block,
+            ULONG share_access,
+            ULONG open_options);
         using RtlNtStatusToDosErrorFn = ULONG(WINAPI*)(NTSTATUS status);
 
         [[nodiscard]] ConsoleControlFn resolve_console_control() noexcept
@@ -141,6 +148,17 @@ namespace oc::runtime
             return reinterpret_cast<RtlNtStatusToDosErrorFn>(::GetProcAddress(ntdll, "RtlNtStatusToDosError"));
         }
 
+        [[nodiscard]] NtOpenFileFn resolve_nt_open_file() noexcept
+        {
+            const HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+            if (ntdll == nullptr)
+            {
+                return nullptr;
+            }
+
+            return reinterpret_cast<NtOpenFileFn>(::GetProcAddress(ntdll, "NtOpenFile"));
+        }
+
         [[nodiscard]] DWORD ntstatus_to_win32_error(const NTSTATUS status, const RtlNtStatusToDosErrorFn converter) noexcept
         {
             if (converter == nullptr)
@@ -150,6 +168,83 @@ namespace oc::runtime
 
             const DWORD error = static_cast<DWORD>(converter(status));
             return error == 0 ? ERROR_GEN_FAILURE : error;
+        }
+
+        [[nodiscard]] std::expected<core::UniqueHandle, SessionError> open_server_relative_file(
+            const core::HandleView server_handle,
+            const NtOpenFileFn nt_open_file,
+            const RtlNtStatusToDosErrorFn rtl_nt_status_to_dos_error,
+            const std::wstring_view child_name,
+            const ACCESS_MASK desired_access,
+            const ULONG open_options) noexcept
+        {
+            if (!server_handle)
+            {
+                return std::unexpected(SessionError{
+                    .context = L"Server handle was invalid while opening server-relative path",
+                    .win32_error = ERROR_INVALID_HANDLE,
+                });
+            }
+            if (nt_open_file == nullptr || rtl_nt_status_to_dos_error == nullptr)
+            {
+                return std::unexpected(SessionError{
+                    .context = L"NTDLL helpers were unavailable while opening server-relative path",
+                    .win32_error = ERROR_PROC_NOT_FOUND,
+                });
+            }
+            if (child_name.size() > (std::numeric_limits<USHORT>::max() / sizeof(wchar_t)))
+            {
+                return std::unexpected(SessionError{
+                    .context = L"Server-relative path was too long",
+                    .win32_error = ERROR_FILENAME_EXCED_RANGE,
+                });
+            }
+
+            std::wstring child;
+            try
+            {
+                child.assign(child_name);
+                child.push_back(L'\0');
+            }
+            catch (...)
+            {
+                return std::unexpected(SessionError{
+                    .context = L"Failed to allocate server-relative child path buffer",
+                    .win32_error = ERROR_OUTOFMEMORY,
+                });
+            }
+
+            UNICODE_STRING unicode_name{};
+            unicode_name.Buffer = child.data();
+            unicode_name.Length = static_cast<USHORT>(child_name.size() * sizeof(wchar_t));
+            unicode_name.MaximumLength = static_cast<USHORT>(unicode_name.Length + sizeof(wchar_t));
+
+            OBJECT_ATTRIBUTES object_attributes{};
+            InitializeObjectAttributes(
+                &object_attributes,
+                &unicode_name,
+                OBJ_CASE_INSENSITIVE,
+                server_handle.get(),
+                nullptr);
+
+            IO_STATUS_BLOCK io_status{};
+            HANDLE opened = nullptr;
+            const NTSTATUS status = nt_open_file(
+                &opened,
+                desired_access,
+                &object_attributes,
+                &io_status,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                open_options);
+            if (status < 0)
+            {
+                return std::unexpected(SessionError{
+                    .context = L"NtOpenFile failed for server-relative path",
+                    .win32_error = ntstatus_to_win32_error(status, rtl_nt_status_to_dos_error),
+                });
+            }
+
+            return core::UniqueHandle(opened);
         }
 
         void notify_console_application_best_effort(
@@ -644,10 +739,20 @@ namespace oc::runtime
             }
 
             const DWORD delegated_pid = ::GetProcessId(process.get());
-            logger.log(
-                logging::LogLevel::info,
-                L"IConsoleHandoff::EstablishHandoff succeeded (delegated_host_pid={})",
-                delegated_pid);
+            if (delegated_pid != 0)
+            {
+                logger.log(
+                    logging::LogLevel::info,
+                    L"IConsoleHandoff::EstablishHandoff succeeded (delegated_host_pid={})",
+                    delegated_pid);
+            }
+            else
+            {
+                logger.log(
+                    logging::LogLevel::debug,
+                    L"IConsoleHandoff::EstablishHandoff succeeded, delegated host PID unavailable (GetProcessId error={})",
+                    ::GetLastError());
+            }
 
             return process;
         }
@@ -2016,11 +2121,21 @@ namespace oc::runtime
                                                         ? 0
                                                         : static_cast<DWORD>(attach.Process);
                                                     const DWORD delegated_pid = ::GetProcessId(delegated_process->get());
-                                                    logger.log(
-                                                        logging::LogLevel::info,
-                                                        L"Default-terminal delegation established; delegated_host_pid={}, client_pid={}, waiting for delegated host exit",
-                                                        delegated_pid,
-                                                        client_pid);
+                                                    if (delegated_pid != 0)
+                                                    {
+                                                        logger.log(
+                                                            logging::LogLevel::info,
+                                                            L"Default-terminal delegation established; delegated_host_pid={}, client_pid={}, waiting for delegated host exit",
+                                                            delegated_pid,
+                                                            client_pid);
+                                                    }
+                                                    else
+                                                    {
+                                                        logger.log(
+                                                            logging::LogLevel::info,
+                                                            L"Default-terminal delegation established; delegated_host_pid=<unavailable>, client_pid={}, waiting for delegated host exit",
+                                                            client_pid);
+                                                    }
 
                                                     // The delegated host owns the input event after a successful handoff.
                                                     input_available_event.reset();
@@ -2138,39 +2253,225 @@ namespace oc::runtime
                                                     // Allow the delegated host to observe pipe closure when it exits.
                                                     signal_pipe_pair->write_end.reset();
 
-                                                    // Important: wait only on the delegated host process.
+                                                    // Wait for the handoff lifetime to end.
                                                     //
-                                                    // Waiting on other objects associated with the console
-                                                    // server handle (for example server-relative files) is
-                                                    // fragile because they may be waitable and already in
-                                                    // the signaled state immediately after opening, which
-                                                    // would cause this process to exit too early and tear
-                                                    // down the server. The inbox conhost waits only on the
-                                                    // returned process handle for the successful handoff.
-                                                    const DWORD wait_result = ::WaitForSingleObject(delegated_process->get(), INFINITE);
-                                                    if (wait_result != WAIT_OBJECT_0)
+                                                    // Upstream conhost exits after waiting on the delegated host
+                                                    // process handle returned by `IConsoleHandoff::EstablishHandoff`.
+                                                    //
+                                                    // In practice, some delegation targets return a short-lived
+                                                    // process handle (for example a broker process that spawns the
+                                                    // real UI host and then terminates). Exiting at that point would
+                                                    // tear down the console server and prevent the delegated UI from
+                                                    // running the intended console application.
+                                                    //
+                                                    // We therefore treat the delegated process handle as an
+                                                    // observation/logging source, but keep the inbox process alive
+                                                    // until either:
+                                                    // - the host-signal pipe reader terminates (writer side closed), or
+                                                    // - a usable ConDrv server-relative `\\Reference` handle signals.
+                                                    //
+                                                    // If neither guard is available, we fall back to the upstream
+                                                    // behavior and wait only on the delegated process handle.
+                                                    std::optional<core::UniqueHandle> console_reference;
+                                                    if (const auto nt_open_file = resolve_nt_open_file();
+                                                        nt_open_file != nullptr)
                                                     {
-                                                        return std::unexpected(SessionError{
-                                                            .context = L"WaitForSingleObject failed for delegated host process",
-                                                            .win32_error = ::GetLastError(),
-                                                        });
+                                                        if (auto reference = open_server_relative_file(
+                                                                options.server_handle,
+                                                                nt_open_file,
+                                                                resolve_rtl_nt_status_to_dos_error(),
+                                                                L"\\Reference",
+                                                                GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE,
+                                                                FILE_SYNCHRONOUS_IO_NONALERT);
+                                                            reference)
+                                                        {
+                                                            const DWORD state = ::WaitForSingleObject(reference->get(), 0);
+                                                            if (state == WAIT_TIMEOUT)
+                                                            {
+                                                                console_reference.emplace(std::move(reference.value()));
+                                                            }
+                                                            else if (state == WAIT_OBJECT_0)
+                                                            {
+                                                                logger.log(
+                                                                    logging::LogLevel::debug,
+                                                                    L"ConDrv \\\\Reference handle was signaled immediately; ignoring it for delegation lifetime wait");
+                                                            }
+                                                            else if (state == WAIT_FAILED)
+                                                            {
+                                                                logger.log(
+                                                                    logging::LogLevel::debug,
+                                                                    L"WaitForSingleObject failed for ConDrv \\\\Reference handle; ignoring it for delegation lifetime wait (error={})",
+                                                                    ::GetLastError());
+                                                            }
+                                                            else
+                                                            {
+                                                                logger.log(
+                                                                    logging::LogLevel::debug,
+                                                                    L"ConDrv \\\\Reference wait state was unexpected; ignoring it for delegation lifetime wait (state={})",
+                                                                    static_cast<unsigned long>(state));
+                                                            }
+                                                        }
+                                                        else
+                                                        {
+                                                            logger.log(
+                                                                logging::LogLevel::debug,
+                                                                L"Opening ConDrv \\\\Reference handle failed; ignoring it for delegation lifetime wait. context='{}', error={}",
+                                                                reference.error().context,
+                                                                reference.error().win32_error);
+                                                        }
                                                     }
 
+                                                    core::HandleView signal_thread_handle;
+                                                    if (signal_input)
+                                                    {
+                                                        signal_thread_handle = signal_input->thread_handle();
+                                                    }
+
+                                                    bool have_guard = console_reference.has_value() || signal_thread_handle.valid();
+                                                    bool observe_delegated = true;
+                                                    bool delegated_signaled = false;
                                                     DWORD exit_code = 0;
-                                                    if (::GetExitCodeProcess(delegated_process->get(), &exit_code) == FALSE)
-                                                    {
-                                                        return std::unexpected(SessionError{
-                                                            .context = L"GetExitCodeProcess failed for delegated host process",
-                                                            .win32_error = ::GetLastError(),
-                                                        });
-                                                    }
 
-                                                    logger.log(
-                                                        logging::LogLevel::info,
-                                                        L"Delegated host process exited: pid={}, exit_code={}",
-                                                        delegated_pid,
-                                                        exit_code);
-                                                    return exit_code;
+                                                    for (;;)
+                                                    {
+                                                        std::array<HANDLE, 3> handles{};
+                                                        std::array<unsigned char, 3> kinds{};
+                                                        DWORD count = 0;
+
+                                                        auto add_handle = [&](const HANDLE handle, const unsigned char kind) noexcept {
+                                                            handles[count] = handle;
+                                                            kinds[count] = kind;
+                                                            ++count;
+                                                        };
+
+                                                        // Kinds:
+                                                        // - 0: delegated host process handle
+                                                        // - 1: ConDrv \\Reference lifetime handle
+                                                        // - 2: host-signal input thread (pipe disconnect indicator)
+                                                        if (observe_delegated)
+                                                        {
+                                                            add_handle(delegated_process->get(), 0);
+                                                        }
+                                                        if (console_reference)
+                                                        {
+                                                            add_handle(console_reference->get(), 1);
+                                                        }
+                                                        if (signal_thread_handle.valid())
+                                                        {
+                                                            add_handle(signal_thread_handle.get(), 2);
+                                                        }
+
+                                                        const DWORD wait_result = (count == 1)
+                                                            ? ::WaitForSingleObject(handles[0], INFINITE)
+                                                            : ::WaitForMultipleObjects(count, handles.data(), FALSE, INFINITE);
+
+                                                        if (wait_result == WAIT_FAILED)
+                                                        {
+                                                            return std::unexpected(SessionError{
+                                                                .context = L"WaitForMultipleObjects failed during delegation wait",
+                                                                .win32_error = ::GetLastError(),
+                                                            });
+                                                        }
+
+                                                        if (wait_result < WAIT_OBJECT_0 || wait_result >= WAIT_OBJECT_0 + count)
+                                                        {
+                                                            return std::unexpected(SessionError{
+                                                                .context = L"WaitForMultipleObjects returned an unexpected result during delegation wait",
+                                                                .win32_error = ::GetLastError(),
+                                                            });
+                                                        }
+
+                                                        const DWORD index = wait_result - WAIT_OBJECT_0;
+                                                        const unsigned char kind = kinds[index];
+
+                                                        if (kind == 0)
+                                                        {
+                                                            delegated_signaled = true;
+                                                            observe_delegated = false;
+
+                                                            if (::GetExitCodeProcess(delegated_process->get(), &exit_code) == FALSE)
+                                                            {
+                                                                const DWORD error = ::GetLastError();
+                                                                if (error == ERROR_ACCESS_DENIED)
+                                                                {
+                                                                    logger.log(
+                                                                        logging::LogLevel::debug,
+                                                                        L"Delegated host exit code unavailable (GetExitCodeProcess access denied); returning exit code 0.");
+                                                                    exit_code = 0;
+                                                                }
+                                                                else
+                                                                {
+                                                                    return std::unexpected(SessionError{
+                                                                        .context = L"GetExitCodeProcess failed for delegated host process",
+                                                                        .win32_error = error,
+                                                                    });
+                                                                }
+                                                            }
+
+                                                            if (have_guard)
+                                                            {
+                                                                logger.log(
+                                                                    logging::LogLevel::info,
+                                                                    L"Delegated host process handle signaled; deferring exit until delegation lifetime guard ends");
+                                                                continue;
+                                                            }
+
+                                                            if (delegated_pid != 0)
+                                                            {
+                                                                logger.log(
+                                                                    logging::LogLevel::info,
+                                                                    L"Delegated host process exited: pid={}, exit_code={}",
+                                                                    delegated_pid,
+                                                                    exit_code);
+                                                            }
+                                                            else
+                                                            {
+                                                                logger.log(
+                                                                    logging::LogLevel::info,
+                                                                    L"Delegated host process exited: pid=<unavailable>, exit_code={}",
+                                                                    exit_code);
+                                                            }
+                                                            return exit_code;
+                                                        }
+
+                                                        if (kind == 1)
+                                                        {
+                                                            logger.log(
+                                                                logging::LogLevel::info,
+                                                                L"Delegation lifetime ended (ConDrv \\\\Reference signaled)");
+                                                        }
+                                                        else
+                                                        {
+                                                            logger.log(
+                                                                logging::LogLevel::info,
+                                                                L"Delegation lifetime ended (host-signal pipe closed)");
+                                                        }
+
+                                                        if (delegated_signaled)
+                                                        {
+                                                            if (delegated_pid != 0)
+                                                            {
+                                                                logger.log(
+                                                                    logging::LogLevel::info,
+                                                                    L"Delegated host process exited: pid={}, exit_code={}",
+                                                                    delegated_pid,
+                                                                    exit_code);
+                                                            }
+                                                            else
+                                                            {
+                                                                logger.log(
+                                                                    logging::LogLevel::info,
+                                                                    L"Delegated host process exited: pid=<unavailable>, exit_code={}",
+                                                                    exit_code);
+                                                            }
+                                                            return exit_code;
+                                                        }
+
+                                                        // The delegation lifetime ended without us observing the
+                                                        // delegated process handle. Return 0 to match the inbox host's
+                                                        // ExitProcess(S_OK) behavior.
+                                                        return 0;
+                                                    }
                                                 }
 
                                                 logger.log(

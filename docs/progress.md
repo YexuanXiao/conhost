@@ -4,6 +4,7 @@
 - Fixed default-terminal delegation for classic windowed `--server` startup:
   - when started as `--server` in non-headless, non-ConPTY mode, `runtime::Session` now probes `HKCU\\Console\\%%Startup\\DelegationConsole` and calls `IConsoleHandoff::EstablishHandoff`.
   - on successful handoff, `openconsole_new` does not create a classic window; it waits for the delegated host to exit **or** for the ConDrv `\\Reference` handle to signal (so the stub exits when the console session ends even if the delegated process is long-lived).
+  - hardened the delegation lifetime wait: if the delegated host process handle signals early but the host-signal channel is still active, `openconsole_new` defers exit until the session lifetime guard ends to avoid tearing down the console server prematurely.
 - Implemented host-signal handling for delegated startup:
   - the stub now runs `runtime::HostSignalInputThread` and honors `EndTask` requests from the delegated host.
   - this fixes the case where closing the delegated/third-party terminal left the console client running headlessly, preventing `openconsole_new` from exiting.
@@ -22,6 +23,9 @@
 - Added startup debugger hold option:
   - added `break_on_start` / `OPENCONSOLE_NEW_BREAK_ON_START`.
   - when enabled, startup waits in 1-second intervals for a debugger to attach, then raises `DebugBreak()`; execution continues when the debugger resumes.
+- Fixed default-terminal delegation exit handling for restricted delegated-process handles:
+  - `GetProcessId` failures on delegated host handles are now logged as "PID unavailable" instead of reporting PID `0`.
+  - `GetExitCodeProcess` access-denied on delegated host handles is now treated as a non-fatal condition (exit code falls back to `0`) so the host does not fail after successful delegation.
 
 ## 2026-02-16
 - Implemented VT insert/replace mode (IRM, `CSI 4 h` / `CSI 4 l`) for printable output when `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is enabled:
