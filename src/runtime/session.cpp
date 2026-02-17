@@ -1,5 +1,6 @@
 #include "runtime/session.hpp"
 
+#include "condrv/condrv_device_comm.hpp"
 #include "condrv/condrv_server.hpp"
 #include "core/assert.hpp"
 #include "core/handle_view.hpp"
@@ -10,15 +11,374 @@
 #include "runtime/key_input_encoder.hpp"
 #include "runtime/server_handle_validator.hpp"
 
+#include "IConsoleHandoff.h"
+
+#include <Windows.h>
+#include <objbase.h>
+
 #include <array>
 #include <cstddef>
 #include <memory>
+#include <optional>
+#include <string_view>
 #include <vector>
 
 namespace oc::runtime
 {
     namespace
     {
+        constexpr CLSID k_clsid_default{};
+        constexpr CLSID k_clsid_conhost = {
+            0xb23d10c0, 0xe52e, 0x411e, { 0x9d, 0x5b, 0xc0, 0x9f, 0xdf, 0x70, 0x9c, 0x7d }
+        };
+
+        constexpr std::wstring_view k_startup_key = L"Console\\%%Startup";
+        constexpr std::wstring_view k_delegation_console_value = L"DelegationConsole";
+
+        [[nodiscard]] bool guid_equal(const GUID& left, const GUID& right) noexcept
+        {
+            return ::InlineIsEqualGUID(left, right) != FALSE;
+        }
+
+        [[nodiscard]] DWORD to_win32_error_from_hresult(const HRESULT hr) noexcept
+        {
+            const DWORD code = static_cast<DWORD>(HRESULT_CODE(hr));
+            return code == 0 ? ERROR_GEN_FAILURE : code;
+        }
+
+        class UniqueRegistryKey final
+        {
+        public:
+            UniqueRegistryKey() noexcept = default;
+
+            explicit UniqueRegistryKey(HKEY value) noexcept :
+                _value(value)
+            {
+            }
+
+            ~UniqueRegistryKey() noexcept
+            {
+                reset();
+            }
+
+            UniqueRegistryKey(const UniqueRegistryKey&) = delete;
+            UniqueRegistryKey& operator=(const UniqueRegistryKey&) = delete;
+
+            UniqueRegistryKey(UniqueRegistryKey&& other) noexcept :
+                _value(other.release())
+            {
+            }
+
+            UniqueRegistryKey& operator=(UniqueRegistryKey&& other) noexcept
+            {
+                if (this != &other)
+                {
+                    reset(other.release());
+                }
+                return *this;
+            }
+
+            [[nodiscard]] HKEY get() const noexcept
+            {
+                return _value;
+            }
+
+            [[nodiscard]] HKEY* put() noexcept
+            {
+                reset();
+                return &_value;
+            }
+
+            [[nodiscard]] bool valid() const noexcept
+            {
+                return _value != nullptr;
+            }
+
+            HKEY release() noexcept
+            {
+                HKEY detached = _value;
+                _value = nullptr;
+                return detached;
+            }
+
+            void reset(HKEY replacement = nullptr) noexcept
+            {
+                if (_value != nullptr)
+                {
+                    (void)::RegCloseKey(_value);
+                }
+                _value = replacement;
+            }
+
+        private:
+            HKEY _value{ nullptr };
+        };
+
+        class CoInitScope final
+        {
+        public:
+            explicit CoInitScope(const HRESULT result) noexcept :
+                _result(result)
+            {
+            }
+
+            ~CoInitScope() noexcept
+            {
+                if (SUCCEEDED(_result))
+                {
+                    ::CoUninitialize();
+                }
+            }
+
+            [[nodiscard]] HRESULT result() const noexcept
+            {
+                return _result;
+            }
+
+        private:
+            HRESULT _result{ E_FAIL };
+        };
+
+        template<typename T>
+        class UniqueComInterface final
+        {
+        public:
+            UniqueComInterface() noexcept = default;
+
+            ~UniqueComInterface() noexcept
+            {
+                reset();
+            }
+
+            UniqueComInterface(const UniqueComInterface&) = delete;
+            UniqueComInterface& operator=(const UniqueComInterface&) = delete;
+
+            UniqueComInterface(UniqueComInterface&& other) noexcept :
+                _value(other.release())
+            {
+            }
+
+            UniqueComInterface& operator=(UniqueComInterface&& other) noexcept
+            {
+                if (this != &other)
+                {
+                    reset(other.release());
+                }
+                return *this;
+            }
+
+            [[nodiscard]] T* get() const noexcept
+            {
+                return _value;
+            }
+
+            [[nodiscard]] T** put() noexcept
+            {
+                reset();
+                return &_value;
+            }
+
+            void reset(T* replacement = nullptr) noexcept
+            {
+                if (_value != nullptr)
+                {
+                    _value->Release();
+                }
+                _value = replacement;
+            }
+
+            T* release() noexcept
+            {
+                T* detached = _value;
+                _value = nullptr;
+                return detached;
+            }
+
+        private:
+            T* _value{ nullptr };
+        };
+
+        struct PipePair final
+        {
+            core::UniqueHandle read_end;
+            core::UniqueHandle write_end;
+        };
+
+        [[nodiscard]] std::expected<PipePair, SessionError> create_signal_pipe_pair() noexcept
+        {
+            SECURITY_ATTRIBUTES security{};
+            security.nLength = sizeof(security);
+            security.lpSecurityDescriptor = nullptr;
+            security.bInheritHandle = FALSE;
+
+            PipePair pair{};
+            if (::CreatePipe(pair.read_end.put(), pair.write_end.put(), &security, 0) == FALSE)
+            {
+                return std::unexpected(SessionError{
+                    .context = L"CreatePipe failed for default-terminal handoff signal pipe",
+                    .win32_error = ::GetLastError(),
+                });
+            }
+
+            return pair;
+        }
+
+        [[nodiscard]] std::expected<std::optional<CLSID>, SessionError> resolve_console_handoff_clsid() noexcept
+        {
+            UniqueRegistryKey startup_key{};
+            const LONG open_status = ::RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                k_startup_key.data(),
+                0,
+                KEY_QUERY_VALUE,
+                startup_key.put());
+            if (open_status == ERROR_FILE_NOT_FOUND)
+            {
+                return std::optional<CLSID>{};
+            }
+            if (open_status != ERROR_SUCCESS)
+            {
+                return std::unexpected(SessionError{
+                    .context = L"RegOpenKeyExW failed for HKCU\\Console\\%%Startup",
+                    .win32_error = static_cast<DWORD>(open_status),
+                });
+            }
+
+            DWORD value_type = 0;
+            DWORD value_bytes = 0;
+            const LONG size_status = ::RegQueryValueExW(
+                startup_key.get(),
+                k_delegation_console_value.data(),
+                nullptr,
+                &value_type,
+                nullptr,
+                &value_bytes);
+            if (size_status == ERROR_FILE_NOT_FOUND)
+            {
+                return std::optional<CLSID>{};
+            }
+            if (size_status != ERROR_SUCCESS)
+            {
+                return std::unexpected(SessionError{
+                    .context = L"RegQueryValueExW size query failed for DelegationConsole",
+                    .win32_error = static_cast<DWORD>(size_status),
+                });
+            }
+            if (value_type != REG_SZ || value_bytes < sizeof(wchar_t))
+            {
+                return std::unexpected(SessionError{
+                    .context = L"DelegationConsole value had an unexpected format",
+                    .win32_error = ERROR_BAD_FORMAT,
+                });
+            }
+
+            std::vector<wchar_t> text;
+            try
+            {
+                text.assign((value_bytes / sizeof(wchar_t)) + 1, L'\0');
+            }
+            catch (...)
+            {
+                return std::unexpected(SessionError{
+                    .context = L"Failed to allocate buffer for DelegationConsole registry value",
+                    .win32_error = ERROR_OUTOFMEMORY,
+                });
+            }
+
+            const LONG read_status = ::RegQueryValueExW(
+                startup_key.get(),
+                k_delegation_console_value.data(),
+                nullptr,
+                &value_type,
+                reinterpret_cast<BYTE*>(text.data()),
+                &value_bytes);
+            if (read_status != ERROR_SUCCESS)
+            {
+                return std::unexpected(SessionError{
+                    .context = L"RegQueryValueExW read failed for DelegationConsole",
+                    .win32_error = static_cast<DWORD>(read_status),
+                });
+            }
+            text.back() = L'\0';
+
+            CLSID handoff_clsid{};
+            const HRESULT parse_hr = ::CLSIDFromString(text.data(), &handoff_clsid);
+            if (FAILED(parse_hr))
+            {
+                return std::unexpected(SessionError{
+                    .context = L"CLSIDFromString failed for DelegationConsole",
+                    .win32_error = to_win32_error_from_hresult(parse_hr),
+                });
+            }
+
+            if (guid_equal(handoff_clsid, k_clsid_default) || guid_equal(handoff_clsid, k_clsid_conhost))
+            {
+                return std::optional<CLSID>{};
+            }
+
+            return handoff_clsid;
+        }
+
+        [[nodiscard]] std::expected<core::UniqueHandle, SessionError> invoke_console_handoff(
+            const CLSID& handoff_clsid,
+            const core::HandleView server_handle,
+            const core::HandleView input_event,
+            const CONSOLE_PORTABLE_ATTACH_MSG& attach_msg,
+            const core::HandleView signal_pipe,
+            const core::HandleView inbox_process) noexcept
+        {
+            const CoInitScope coinit(::CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+            if (FAILED(coinit.result()))
+            {
+                return std::unexpected(SessionError{
+                    .context = L"CoInitializeEx failed for console handoff",
+                    .win32_error = to_win32_error_from_hresult(coinit.result()),
+                });
+            }
+
+            UniqueComInterface<IConsoleHandoff> handoff{};
+            const HRESULT create_hr = ::CoCreateInstance(
+                handoff_clsid,
+                nullptr,
+                CLSCTX_LOCAL_SERVER,
+                __uuidof(IConsoleHandoff),
+                reinterpret_cast<void**>(handoff.put()));
+            if (FAILED(create_hr))
+            {
+                return std::unexpected(SessionError{
+                    .context = L"CoCreateInstance failed for IConsoleHandoff",
+                    .win32_error = to_win32_error_from_hresult(create_hr),
+                });
+            }
+
+            HANDLE delegated_process = nullptr;
+            const HRESULT handoff_hr = handoff.get()->EstablishHandoff(
+                server_handle.get(),
+                input_event.get(),
+                &attach_msg,
+                signal_pipe.get(),
+                inbox_process.get(),
+                &delegated_process);
+            if (FAILED(handoff_hr))
+            {
+                return std::unexpected(SessionError{
+                    .context = L"IConsoleHandoff::EstablishHandoff failed",
+                    .win32_error = to_win32_error_from_hresult(handoff_hr),
+                });
+            }
+
+            core::UniqueHandle process(delegated_process);
+            if (!process.valid())
+            {
+                return std::unexpected(SessionError{
+                    .context = L"IConsoleHandoff returned an invalid process handle",
+                    .win32_error = ERROR_INVALID_HANDLE,
+                });
+            }
+
+            return process;
+        }
+
         struct WindowedServerContext final
         {
             core::HandleView server_handle{};
@@ -26,6 +386,8 @@ namespace oc::runtime
             logging::Logger* logger{};
             HWND window{};
             std::shared_ptr<condrv::PublishedScreenBuffer> published_screen;
+            core::UniqueHandle input_available_event;
+            std::optional<condrv::IoPacket> initial_packet;
 
             DWORD exit_code{ 0 };
             SessionError error{};
@@ -40,15 +402,33 @@ namespace oc::runtime
                 return 0;
             }
 
-            auto result = condrv::ConDrvServer::run(
-                context->server_handle,
-                context->stop_event,
-                core::HandleView{}, // windowed mode: input source is not a byte pipe yet
-                core::HandleView{}, // windowed mode: output is rendered from published snapshots (no host output pipe)
-                core::HandleView{},
-                *context->logger,
-                context->published_screen,
-                context->window);
+            std::expected<DWORD, condrv::ServerError> result;
+            if (context->initial_packet.has_value())
+            {
+                result = condrv::ConDrvServer::run_with_handoff(
+                    context->server_handle,
+                    context->stop_event,
+                    context->input_available_event.view(),
+                    core::HandleView{}, // windowed mode: input source is not a byte pipe yet
+                    core::HandleView{}, // windowed mode: output is rendered from published snapshots (no host output pipe)
+                    core::HandleView{},
+                    context->initial_packet.value(),
+                    *context->logger,
+                    context->published_screen,
+                    context->window);
+            }
+            else
+            {
+                result = condrv::ConDrvServer::run(
+                    context->server_handle,
+                    context->stop_event,
+                    core::HandleView{}, // windowed mode: input source is not a byte pipe yet
+                    core::HandleView{}, // windowed mode: output is rendered from published snapshots (no host output pipe)
+                    core::HandleView{},
+                    *context->logger,
+                    context->published_screen,
+                    context->window);
+            }
 
             if (result)
             {
@@ -99,9 +479,169 @@ namespace oc::runtime
             return 0;
         }
 
+        struct HostSignalPipeDrainContext final
+        {
+            core::HandleView pipe{};
+        };
+
+        DWORD WINAPI host_signal_pipe_drain_thread_proc(void* param)
+        {
+            auto* context = static_cast<HostSignalPipeDrainContext*>(param);
+            if (context == nullptr || !context->pipe)
+            {
+                return 0;
+            }
+
+            std::array<std::byte, 256> buffer{};
+            for (;;)
+            {
+                DWORD read = 0;
+                if (::ReadFile(
+                        context->pipe.get(),
+                        buffer.data(),
+                        static_cast<DWORD>(buffer.size()),
+                        &read,
+                        nullptr) == FALSE)
+                {
+                    const DWORD error = ::GetLastError();
+                    if (error == ERROR_BROKEN_PIPE ||
+                        error == ERROR_PIPE_NOT_CONNECTED ||
+                        error == ERROR_NO_DATA ||
+                        error == ERROR_OPERATION_ABORTED ||
+                        error == ERROR_CANCELLED)
+                    {
+                        return 0;
+                    }
+
+                    return 0;
+                }
+
+                if (read == 0)
+                {
+                    return 0;
+                }
+            }
+        }
+
+        class HostSignalPipeDrain final
+        {
+        public:
+            HostSignalPipeDrain() noexcept = default;
+
+            ~HostSignalPipeDrain() noexcept
+            {
+                stop_and_join();
+            }
+
+            HostSignalPipeDrain(const HostSignalPipeDrain&) = delete;
+            HostSignalPipeDrain& operator=(const HostSignalPipeDrain&) = delete;
+
+            HostSignalPipeDrain(HostSignalPipeDrain&& other) noexcept :
+                _thread(std::move(other._thread)),
+                _pipe(std::move(other._pipe)),
+                _context(std::move(other._context))
+            {
+                other._context.reset();
+            }
+
+            HostSignalPipeDrain& operator=(HostSignalPipeDrain&& other) noexcept
+            {
+                if (this != &other)
+                {
+                    stop_and_join();
+                    _thread = std::move(other._thread);
+                    _pipe = std::move(other._pipe);
+                    _context = std::move(other._context);
+                    other._context.reset();
+                }
+                return *this;
+            }
+
+            [[nodiscard]] static std::expected<HostSignalPipeDrain, SessionError> start(const core::HandleView pipe_read_end) noexcept
+            {
+                if (!pipe_read_end)
+                {
+                    return std::unexpected(SessionError{
+                        .context = L"Host signal pipe read handle was invalid",
+                        .win32_error = ERROR_INVALID_HANDLE,
+                    });
+                }
+
+                auto duplicated_pipe = core::duplicate_handle_same_access(pipe_read_end, false);
+                if (!duplicated_pipe)
+                {
+                    return std::unexpected(SessionError{
+                        .context = L"DuplicateHandle failed for host signal pipe read handle",
+                        .win32_error = duplicated_pipe.error(),
+                    });
+                }
+
+                core::UniqueHandle owned_pipe = std::move(duplicated_pipe.value());
+
+                std::unique_ptr<HostSignalPipeDrainContext> context;
+                try
+                {
+                    context = std::make_unique<HostSignalPipeDrainContext>();
+                }
+                catch (...)
+                {
+                    return std::unexpected(SessionError{
+                        .context = L"Failed to allocate host signal pipe drain context",
+                        .win32_error = ERROR_OUTOFMEMORY,
+                    });
+                }
+                context->pipe = owned_pipe.view();
+
+                core::UniqueHandle thread(::CreateThread(
+                    nullptr,
+                    0,
+                    &host_signal_pipe_drain_thread_proc,
+                    context.get(),
+                    0,
+                    nullptr));
+                if (!thread.valid())
+                {
+                    return std::unexpected(SessionError{
+                        .context = L"CreateThread failed for host signal pipe drain",
+                        .win32_error = ::GetLastError(),
+                    });
+                }
+
+                HostSignalPipeDrain drain{};
+                drain._thread = std::move(thread);
+                drain._pipe = std::move(owned_pipe);
+                drain._context = std::move(context);
+                return drain;
+            }
+
+            void stop_and_join() noexcept
+            {
+                if (_thread.valid())
+                {
+                    if (_pipe.valid())
+                    {
+                        (void)::CancelIoEx(_pipe.get(), nullptr);
+                    }
+                    (void)::CancelSynchronousIo(_thread.get());
+                    (void)::WaitForSingleObject(_thread.get(), INFINITE);
+                    _thread.reset();
+                }
+
+                _context.reset();
+                _pipe.reset();
+            }
+
+        private:
+            core::UniqueHandle _thread;
+            core::UniqueHandle _pipe;
+            std::unique_ptr<HostSignalPipeDrainContext> _context;
+        };
+
         [[nodiscard]] std::expected<DWORD, SessionError> run_windowed_server(
             const SessionOptions& options,
-            logging::Logger& logger) noexcept
+            logging::Logger& logger,
+            core::UniqueHandle input_available_event,
+            std::optional<condrv::IoPacket> initial_packet) noexcept
         {
             auto stop_event = core::create_event(true, false, nullptr);
             if (!stop_event)
@@ -189,6 +729,8 @@ namespace oc::runtime
             server_context->logger = &logger;
             server_context->window = (*window)->hwnd();
             server_context->published_screen = std::move(published_screen);
+            server_context->input_available_event = std::move(input_available_event);
+            server_context->initial_packet = std::move(initial_packet);
 
             core::UniqueHandle server_thread(::CreateThread(
                 nullptr,
@@ -223,6 +765,13 @@ namespace oc::runtime
             }
 
             return server_context->exit_code;
+        }
+
+        [[nodiscard]] std::expected<DWORD, SessionError> run_windowed_server(
+            const SessionOptions& options,
+            logging::Logger& logger) noexcept
+        {
+            return run_windowed_server(options, logger, core::UniqueHandle{}, std::optional<condrv::IoPacket>{});
         }
 
         class UniquePseudoConsole final
@@ -1133,7 +1682,167 @@ namespace oc::runtime
 
             if (!options.headless && !options.in_conpty_mode)
             {
+                std::optional<condrv::IoPacket> initial_packet;
+                core::UniqueHandle input_available_event;
+
+                if (!options.force_no_handoff)
+                {
+                    auto delegation_target = resolve_console_handoff_clsid();
+                    if (!delegation_target)
+                    {
+                        logger.log(
+                            logging::LogLevel::warning,
+                            L"Default-terminal delegation probe failed; falling back to classic window. context='{}', error={}",
+                            delegation_target.error().context,
+                            delegation_target.error().win32_error);
+                    }
+                    else if (delegation_target->has_value())
+                    {
+                        auto input_event = core::create_event(true, false, nullptr);
+                        if (!input_event)
+                        {
+                            logger.log(
+                                logging::LogLevel::warning,
+                                L"Default-terminal delegation input event creation failed; falling back to classic window. error={}",
+                                input_event.error());
+                        }
+                        else
+                        {
+                            input_available_event = std::move(input_event.value());
+                            auto comm = condrv::ConDrvDeviceComm::from_server_handle(options.server_handle);
+                            if (!comm)
+                            {
+                                logger.log(
+                                    logging::LogLevel::warning,
+                                    L"Default-terminal delegation could not duplicate server handle; falling back to classic window. context='{}', error={}",
+                                    comm.error().context,
+                                    comm.error().win32_error);
+                            }
+                            else
+                            {
+                                if (auto server_info = comm->set_server_information(input_available_event.view()); !server_info)
+                                {
+                                    logger.log(
+                                        logging::LogLevel::warning,
+                                        L"Default-terminal delegation could not set server information; falling back to classic window. context='{}', error={}",
+                                        server_info.error().context,
+                                        server_info.error().win32_error);
+                                }
+                                else
+                                {
+                                    condrv::IoPacket packet{};
+                                    if (auto read = comm->read_io(nullptr, packet); !read)
+                                    {
+                                        logger.log(
+                                            logging::LogLevel::warning,
+                                            L"Default-terminal delegation initial IO read failed; falling back to classic window. context='{}', error={}",
+                                            read.error().context,
+                                            read.error().win32_error);
+                                    }
+                                    else
+                                    {
+                                        initial_packet.emplace(packet);
+
+                                        CONSOLE_PORTABLE_ATTACH_MSG attach{};
+                                        attach.IdLowPart = packet.descriptor.identifier.LowPart;
+                                        attach.IdHighPart = packet.descriptor.identifier.HighPart;
+                                        attach.Process = static_cast<ULONG64>(packet.descriptor.process);
+                                        attach.Object = static_cast<ULONG64>(packet.descriptor.object);
+                                        attach.Function = packet.descriptor.function;
+                                        attach.InputSize = packet.descriptor.input_size;
+                                        attach.OutputSize = packet.descriptor.output_size;
+
+                                        auto signal_pipe_pair = create_signal_pipe_pair();
+                                        if (!signal_pipe_pair)
+                                        {
+                                            logger.log(
+                                                logging::LogLevel::warning,
+                                                L"Default-terminal delegation signal pipe creation failed; falling back to classic window. error={}",
+                                                signal_pipe_pair.error().win32_error);
+                                        }
+                                        else
+                                        {
+                                            auto inbox_process = core::duplicate_current_process(
+                                                PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+                                                false);
+                                            if (!inbox_process)
+                                            {
+                                                logger.log(
+                                                    logging::LogLevel::warning,
+                                                    L"Default-terminal delegation could not duplicate inbox process handle; falling back to classic window. error={}",
+                                                    inbox_process.error());
+                                            }
+                                            else
+                                            {
+                                                auto delegated_process = invoke_console_handoff(
+                                                    delegation_target->value(),
+                                                    options.server_handle,
+                                                    input_available_event.view(),
+                                                    attach,
+                                                    signal_pipe_pair->write_end.view(),
+                                                    inbox_process->view());
+                                                if (delegated_process)
+                                                {
+                                                    logger.log(logging::LogLevel::info, L"Default-terminal delegation established; waiting for delegated host");
+
+                                                    auto signal_drain = HostSignalPipeDrain::start(signal_pipe_pair->read_end.view());
+                                                    if (!signal_drain)
+                                                    {
+                                                        logger.log(
+                                                            logging::LogLevel::warning,
+                                                            L"Host signal pipe drain thread creation failed; continuing without drain. context='{}', error={}",
+                                                            signal_drain.error().context,
+                                                            signal_drain.error().win32_error);
+                                                    }
+                                                    else
+                                                    {
+                                                        // The drain thread owns its own duplicated pipe handle.
+                                                        signal_pipe_pair->read_end.reset();
+                                                    }
+                                                    // Allow the delegated host to observe pipe closure when it exits.
+                                                    signal_pipe_pair->write_end.reset();
+
+                                                    const DWORD wait_result = ::WaitForSingleObject(delegated_process->get(), INFINITE);
+                                                    if (wait_result != WAIT_OBJECT_0)
+                                                    {
+                                                        return std::unexpected(SessionError{
+                                                            .context = L"WaitForSingleObject failed for delegated host process",
+                                                            .win32_error = ::GetLastError(),
+                                                        });
+                                                    }
+
+                                                    DWORD exit_code = 0;
+                                                    if (::GetExitCodeProcess(delegated_process->get(), &exit_code) == FALSE)
+                                                    {
+                                                        return std::unexpected(SessionError{
+                                                            .context = L"GetExitCodeProcess failed for delegated host process",
+                                                            .win32_error = ::GetLastError(),
+                                                        });
+                                                    }
+
+                                                    return exit_code;
+                                                }
+
+                                                logger.log(
+                                                    logging::LogLevel::warning,
+                                                    L"Default-terminal delegation failed; falling back to classic window. context='{}', error={}",
+                                                    delegated_process.error().context,
+                                                    delegated_process.error().win32_error);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 logger.log(logging::LogLevel::info, L"Starting windowed server host");
+                if (initial_packet.has_value())
+                {
+                    return run_windowed_server(options, logger, std::move(input_available_event), std::move(initial_packet));
+                }
+
                 return run_windowed_server(options, logger);
             }
 

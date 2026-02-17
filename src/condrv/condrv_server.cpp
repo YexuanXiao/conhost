@@ -15,6 +15,7 @@
 #include <deque>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -857,6 +858,7 @@ namespace oc::condrv
                 input_queue);
 
             std::deque<ConDrvApiMessage> pending_replies;
+            std::optional<ConDrvApiMessage> pending_completion;
             std::weak_ptr<ScreenBuffer> last_buffer;
             uint64_t last_revision = 0;
 
@@ -897,12 +899,12 @@ namespace oc::condrv
                 last_revision = revision;
             };
 
-            const auto release_and_complete = [&](ConDrvApiMessage& message) noexcept -> std::expected<void, ServerError> {
+            const auto release_message_buffers = [&](ConDrvApiMessage& message) noexcept -> std::expected<void, ServerError> {
                 // `CancelSynchronousIo` is used to wake this thread when input arrives for reply-pending work.
                 // Even with guarding, there is an unavoidable race where the cancellation lands while the
-                // server is completing a different synchronous IOCTL. Treat cancellation errors as transient
-                // and retry a few times so the server does not abort the process after successfully
-                // servicing client requests.
+                // server is completing a different synchronous IOCTL. Treat cancellation errors as
+                // transient and retry a few times so the server does not abort the process after it
+                // already serviced a client request.
                 constexpr int max_retries = 8;
 
                 for (int attempt = 0;; ++attempt)
@@ -921,6 +923,15 @@ namespace oc::condrv
 
                     return std::unexpected(make_error(released.error().context, error));
                 }
+
+                return {};
+            };
+
+            const auto complete_io_direct = [&](ConDrvApiMessage& message) noexcept -> std::expected<void, ServerError> {
+                // Slow-path fallback: in normal operation, completions are submitted via the optional
+                // input buffer on `IOCTL_CONDRV_READ_IO`. Direct completion is kept only for shutdown
+                // paths where there may be no subsequent ReadIo call.
+                constexpr int max_retries = 8;
 
                 for (int attempt = 0;; ++attempt)
                 {
@@ -942,12 +953,24 @@ namespace oc::condrv
                 return {};
             };
 
+            const auto release_and_stage_completion = [&](ConDrvApiMessage& message) noexcept -> std::expected<void, ServerError> {
+                OC_ASSERT(!pending_completion.has_value());
+
+                if (auto released = release_message_buffers(message); !released)
+                {
+                    return std::unexpected(released.error());
+                }
+
+                pending_completion.emplace(std::move(message));
+                return {};
+            };
+
             const auto update_pending_flag = [&]() noexcept {
                 has_pending_replies.store(!pending_replies.empty(), std::memory_order_release);
             };
 
             const auto service_pending_once = [&]() noexcept -> std::expected<bool, ServerError> {
-                if (pending_replies.empty())
+                if (pending_replies.empty() || pending_completion.has_value())
                 {
                     update_pending_flag();
                     return false;
@@ -972,12 +995,13 @@ namespace oc::condrv
                         continue;
                     }
 
-                    if (auto finished = release_and_complete(message); !finished)
+                    if (auto finished = release_and_stage_completion(message); !finished)
                     {
                         return std::unexpected(finished.error());
                     }
 
                     progress = true;
+                    break;
                 }
 
                 update_pending_flag();
@@ -1008,9 +1032,14 @@ namespace oc::condrv
                     message.set_reply_status(core::status_unsuccessful);
                     message.set_reply_information(0);
 
-                    if (auto finished = release_and_complete(message); !finished)
+                    if (auto released = release_message_buffers(message); !released)
                     {
-                        return std::unexpected(finished.error());
+                        return std::unexpected(released.error());
+                    }
+
+                    if (auto completed = complete_io_direct(message); !completed)
+                    {
+                        return std::unexpected(completed.error());
                     }
                 }
 
@@ -1022,6 +1051,7 @@ namespace oc::condrv
             // Publish the initial empty screen so a windowed host can paint immediately.
             maybe_publish_snapshot();
 
+            bool exit_no_clients_requested = false;
             if (initial_packet != nullptr)
             {
                 IoPacket packet_copy = *initial_packet;
@@ -1039,7 +1069,7 @@ namespace oc::condrv
                 }
                 else
                 {
-                    if (auto finished = release_and_complete(message); !finished)
+                    if (auto finished = release_and_stage_completion(message); !finished)
                     {
                         return std::unexpected(finished.error());
                     }
@@ -1047,9 +1077,7 @@ namespace oc::condrv
                     maybe_publish_snapshot();
                     if (outcome->request_exit)
                     {
-                        logger.log(logging::LogLevel::info, L"ConDrv server exiting after handoff (no connected clients)");
-                        (void)fail_all_pending();
-                        return DWORD{ 0 };
+                        exit_no_clients_requested = true;
                     }
                 }
             }
@@ -1058,8 +1086,14 @@ namespace oc::condrv
             bool exit_signal = false;
             bool exit_pipe = false;
 
-            while (!stop_requested.load(std::memory_order_acquire))
+            while (!stop_requested.load(std::memory_order_acquire) || pending_completion.has_value())
             {
+                if (exit_no_clients_requested && !pending_completion.has_value())
+                {
+                    exit_no_clients = true;
+                    break;
+                }
+
                 if (auto drained = service_pending_until_stalled(); !drained)
                 {
                     return std::unexpected(drained.error());
@@ -1070,7 +1104,12 @@ namespace oc::condrv
                 std::expected<void, DeviceCommError> read;
                 {
                     AtomicFlagGuard guard(in_driver_read_io);
-                    read = comm->read_io(nullptr, packet);
+                    const IoComplete* reply = nullptr;
+                    if (pending_completion.has_value())
+                    {
+                        reply = &pending_completion->completion();
+                    }
+                    read = comm->read_io(reply, packet);
                 }
 
                 if (!read)
@@ -1084,6 +1123,15 @@ namespace oc::condrv
 
                     if (error == ERROR_OPERATION_ABORTED || error == ERROR_CANCELLED)
                     {
+                        if (pending_completion.has_value())
+                        {
+                            // ReadIo submitted the completion as part of the input buffer before
+                            // blocking for the next message. If the wait is canceled (to service
+                            // reply-pending work), treat the completion as submitted and drop the
+                            // staged message so we can continue making progress.
+                            pending_completion.reset();
+                        }
+
                         if (stop_requested.load(std::memory_order_acquire))
                         {
                             exit_signal = true;
@@ -1096,6 +1144,8 @@ namespace oc::condrv
 
                     return std::unexpected(make_error(read.error().context, error));
                 }
+
+                pending_completion.reset();
 
                 ConDrvApiMessage message(*comm, packet);
                 auto outcome = dispatch_message(state, message, host_io);
@@ -1111,7 +1161,7 @@ namespace oc::condrv
                     continue;
                 }
 
-                if (auto finished = release_and_complete(message); !finished)
+                if (auto finished = release_and_stage_completion(message); !finished)
                 {
                     return std::unexpected(finished.error());
                 }
@@ -1119,9 +1169,14 @@ namespace oc::condrv
                 maybe_publish_snapshot();
                 if (outcome->request_exit)
                 {
-                    exit_no_clients = true;
-                    break;
+                    exit_no_clients_requested = true;
                 }
+            }
+
+            if (pending_completion.has_value())
+            {
+                (void)complete_io_direct(*pending_completion);
+                pending_completion.reset();
             }
 
             (void)fail_all_pending();
@@ -3185,5 +3240,35 @@ namespace oc::condrv
     catch (...)
     {
         return std::unexpected(make_error(L"Unhandled exception in ConDrv server handoff", ERROR_GEN_FAILURE));
+    }
+
+    std::expected<DWORD, ServerError> ConDrvServer::run_with_handoff(
+        const core::HandleView server_handle,
+        const core::HandleView signal_handle,
+        const core::HandleView input_available_event,
+        const core::HandleView host_input,
+        const core::HandleView host_output,
+        const core::HandleView host_signal_pipe,
+        const IoPacket& initial_packet,
+        logging::Logger& logger,
+        std::shared_ptr<PublishedScreenBuffer> published,
+        const HWND paint_target) noexcept
+    try
+    {
+        return run_loop(
+            server_handle,
+            signal_handle,
+            input_available_event,
+            host_input,
+            host_output,
+            host_signal_pipe,
+            &initial_packet,
+            std::move(published),
+            paint_target,
+            logger);
+    }
+    catch (...)
+    {
+        return std::unexpected(make_error(L"Unhandled exception in ConDrv server handoff (windowed)", ERROR_GEN_FAILURE));
     }
 }

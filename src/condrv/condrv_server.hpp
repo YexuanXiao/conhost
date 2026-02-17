@@ -9371,5 +9371,21 @@ namespace oc::logging
             core::HandleView host_signal_pipe,
             const IoPacket& initial_packet,
             logging::Logger& logger) noexcept;
+
+        // Windowed variant of the handoff entry point. This is used when the
+        // inbox host already consumed the first `IOCTL_CONDRV_READ_IO` packet
+        // (to probe default-terminal delegation) but must still fall back to a
+        // classic windowed host when delegation fails.
+        [[nodiscard]] static std::expected<DWORD, ServerError> run_with_handoff(
+            core::HandleView server_handle,
+            core::HandleView signal_handle,
+            core::HandleView input_available_event,
+            core::HandleView host_input,
+            core::HandleView host_output,
+            core::HandleView host_signal_pipe,
+            const IoPacket& initial_packet,
+            logging::Logger& logger,
+            std::shared_ptr<PublishedScreenBuffer> published,
+            HWND paint_target) noexcept;
     };
 }

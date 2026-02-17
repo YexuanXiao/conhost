@@ -1,5 +1,13 @@
 # Progress Log
 
+## 2026-02-17
+- Fixed default-terminal delegation for classic windowed `--server` startup:
+  - when started as `--server` in non-headless, non-ConPTY mode, `runtime::Session` now probes `HKCU\\Console\\%%Startup\\DelegationConsole` and calls `IConsoleHandoff::EstablishHandoff`.
+  - on successful handoff, `openconsole_new` does not create a classic window; it waits for the delegated host to exit.
+- Hardened the ConDrv server completion path to eliminate intermittent `ERROR_OPERATION_ABORTED` (995) failures from `IOCTL_CONDRV_COMPLETE_IO`:
+  - removed `IOCTL_CONDRV_COMPLETE_IO` from the hot path.
+  - completions are now submitted via the completion input parameter on the next `IOCTL_CONDRV_READ_IO` call, keeping the message alive until completion submission so completion write buffers remain valid.
+
 ## 2026-02-16
 - Implemented VT insert/replace mode (IRM, `CSI 4 h` / `CSI 4 l`) for printable output when `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is enabled:
   - `ScreenBuffer` now tracks `vt_insert_mode_enabled`.
