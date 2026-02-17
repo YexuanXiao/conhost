@@ -12,6 +12,32 @@
 #include <limits>
 #include <vector>
 
+// `runtime/terminal_handoff.cpp` implements the COM-based "terminal handoff"
+// used by default-terminal integration for ConPTY sessions.
+//
+// When a terminal is registered (via `HKCU\\Console\\%%Startup\\DelegationTerminal`),
+// the console host can ask that terminal to create the UI and to provide the
+// pipe channels used for the ConPTY byte transport.
+//
+// The terminal returns:
+// - host input pipe  (bytes -> pseudo console input),
+// - host output pipe (bytes <- pseudo console output),
+// - signal pipe      (used for lifetime/shutdown signaling).
+//
+// The replacement keeps this logic in a small, testable helper so the main
+// session runtime (`session.cpp`) can treat the result as "just another set of
+// host pipes" for the headless ConDrv server loop.
+//
+// Note on NTDLL usage:
+// - Establishing a ConDrv "console reference" handle requires opening an object
+//   manager name (e.g. `\\Reference`) *relative to* the ConDrv server handle.
+// - Win32 `CreateFileW` does not support the "root handle + relative name"
+//   pattern, so we use `NtOpenFile` via `ntdll.dll` for this one operation.
+//
+// See also:
+// - `new/docs/conhost_source_architecture.md`
+// - `new/docs/conhost_behavior_imitation_matrix.md`
+
 namespace oc::runtime
 {
     namespace
@@ -476,6 +502,9 @@ namespace oc::runtime
             const core::HandleView server_handle,
             logging::Logger& logger) noexcept
         {
+            // COM is used only as a local activation mechanism for the
+            // registered terminal host. The returned channels are plain Win32
+            // handles (pipes) and are subsequently driven without COM.
             const CoInitScope coinit(::CoInitializeEx(nullptr, COINIT_MULTITHREADED));
             if (FAILED(coinit.result()))
             {
@@ -506,6 +535,8 @@ namespace oc::runtime
                 return std::unexpected(ntdll.error());
             }
 
+            // The console reference handle is passed to the terminal so it can
+            // attach to the correct ConDrv server instance.
             auto reference = open_server_relative_file(
                 ntdll.value(),
                 server_handle,
@@ -517,12 +548,18 @@ namespace oc::runtime
                 return std::unexpected(reference.error());
             }
 
+            // Signal pipe for the terminal to request shutdown / signal events.
+            // We pass the write end to the terminal and keep the read end.
             auto signal_pipe = create_pipe_pair();
             if (!signal_pipe)
             {
                 return std::unexpected(signal_pipe.error());
             }
 
+            // As with classic `IConsoleHandoff`, the terminal receives real
+            // handles to both the server and client processes for lifetime
+            // tracking. `GetCurrentProcess()` is a pseudo-handle, so we
+            // duplicate it into real handles before passing them across COM.
             auto server_process = core::duplicate_current_process(
                 PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
                 false);

@@ -2,6 +2,10 @@
 
 #include <Windows.h>
 
+// `cmd.exe` resolution deliberately avoids hard-coding `C:\\Windows` when
+// possible and prefers the `WINDIR` environment variable. This mirrors
+// conhost-style behavior while remaining robust in unusual Windows setups.
+
 namespace oc::runtime
 {
     std::wstring StartupCommand::resolve_default_client_command()
@@ -31,4 +35,3 @@ namespace oc::runtime
         return L"C:\\Windows\\system32\\cmd.exe";
     }
 }
-

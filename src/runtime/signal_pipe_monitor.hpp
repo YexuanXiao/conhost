@@ -12,6 +12,10 @@
 //
 // This class is intentionally minimal: it does not parse ConPTY signal payloads.
 // It only drains bytes and turns broken-pipe into an event signal.
+//
+// See also:
+// - `new/docs/conhost_behavior_imitation_matrix.md` (startup modes)
+// - `new/tests/signal_pipe_monitor_tests.cpp`
 
 #include "core/handle_view.hpp"
 #include "core/unique_handle.hpp"
@@ -90,4 +94,3 @@ namespace oc::runtime
         std::unique_ptr<Context> _context;
     };
 }
-

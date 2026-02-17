@@ -6,6 +6,14 @@
 #include <cmath>
 #include <cstdint>
 
+// DirectWrite-backed font metrics provider.
+//
+// The classic windowed renderer needs stable cell metrics (cell width/height,
+// baseline, underline position, etc.) to render a screen-buffer snapshot.
+//
+// The replacement keeps this as a small non-GUI module so it can be unit tested
+// without creating a window. See `new/docs/design/renderer_text_measurement.md`.
+
 namespace oc::renderer
 {
     namespace

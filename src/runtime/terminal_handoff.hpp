@@ -1,5 +1,26 @@
 #pragma once
 
+// Default-terminal delegation for ConPTY ("terminal handoff").
+//
+// This is distinct from the classic windowed `IConsoleHandoff` flow:
+//
+// - `IConsoleHandoff` / `DelegationConsole` is used when a *windowed* ConDrv
+//   server startup wants to delegate UI hosting to another console host.
+// - `ITerminalHandoff*` / `DelegationTerminal` is used when a ConDrv server
+//   wants to delegate the *terminal UI* for a session to a terminal application
+//   (e.g. Windows Terminal). The terminal connects using pipes and drives the
+//   session through the standard ConPTY byte transport.
+//
+// In the replacement, the `TerminalHandoff` helper:
+// - probes `HKCU\\Console\\%%Startup\\DelegationTerminal`,
+// - calls the COM local server to establish pipe channels,
+// - returns those channels to the caller so the runtime can host the ConDrv
+//   server loop in headless mode while a third-party terminal provides the UI.
+//
+// See also:
+// - `new/docs/conhost_source_architecture.md`
+// - `new/docs/conhost_behavior_imitation_matrix.md`
+
 #include "core/handle_view.hpp"
 #include "core/unique_handle.hpp"
 

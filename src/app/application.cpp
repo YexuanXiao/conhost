@@ -17,6 +17,18 @@
 #include <memory>
 #include <string>
 
+// `app/application.cpp` is the top-level orchestration layer for the executable.
+//
+// Responsibilities:
+// - Load configuration (environment + optional file) and select locale.
+// - Initialize logging sinks (debug output and optional file).
+// - Parse `openconsole_new` command line into a structured `ConsoleArguments`.
+// - Construct `runtime::SessionOptions` and dispatch into `runtime::Session`.
+//
+// This file should remain intentionally free of low-level Win32 lifetime
+// management. Those details live in `core` and `runtime` modules (see
+// `new/docs/conhost_module_partition.md`).
+
 namespace oc::app
 {
     namespace

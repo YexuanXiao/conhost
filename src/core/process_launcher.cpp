@@ -5,6 +5,10 @@
 
 #include <vector>
 
+// `CreateProcessW` requires a mutable command line buffer when `lpCommandLine`
+// is non-null. This helper therefore takes ownership of the command line and
+// materializes it into a writable NUL-terminated buffer.
+
 namespace oc::core
 {
     std::expected<DWORD, ProcessLaunchError> ProcessLauncher::launch_and_wait(std::wstring command_line) noexcept
@@ -68,4 +72,3 @@ namespace oc::core
         return exit_code;
     }
 }
-

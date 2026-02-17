@@ -7,18 +7,37 @@
 // provides the beginning of that behavior so `--server` startup can be serviced
 // incrementally without taking a dependency on the full upstream console model.
 //
- // Current scope (incremental):
- // - CONNECT / DISCONNECT
- // - CREATE_OBJECT / CLOSE_OBJECT (current input/output + new output screen buffers)
- // - RAW_FLUSH returns success
- // - USER_DEFINED: a growing subset needed by classic console clients:
- //   - Get/SetMode, GetCP/SetCP, GetNumberOfInputEvents
- //   - WriteConsole / ReadConsole (byte passthrough + UTF-16 -> UTF-8 for output)
- //   - Screen buffer state (Get/SetCursorInfo, SetCursorPosition, Get/SetScreenBufferInfo,
- //     SetTextAttribute, SetScreenBufferSize, GetLargestWindowSize, SetWindowInfo)
- //   - Output buffer contents (FillConsoleOutput, Read/WriteConsoleOutputString, Read/WriteConsoleOutput)
- //   - ScrollConsoleScreenBuffer and Get/SetTitle
- // - other operations are rejected with STATUS_NOT_IMPLEMENTED
+// Threading model:
+// - The ConDrv server loop is single-threaded and is driven by
+//   `IOCTL_CONDRV_READ_IO` packets.
+// - Helper threads are used only to bridge non-waitable or blocking resources
+//   into explicit cancellation points (for example, monitoring host input pipes
+//   and signal handles). No C++ `<thread>` is used; the implementation relies
+//   on Win32 threads and strict RAII handle wrappers.
+//
+// Reply-pending ("CONSOLE_STATUS_WAIT") behavior:
+// - Input-dependent requests must not block the server loop.
+// - When an operation cannot make progress yet and waiting is allowed, the
+//   request is retained and retried later when input arrives.
+// - See `new/docs/design/condrv_reply_pending_wait_queue.md`.
+//
+// Current scope (incremental):
+// - CONNECT / DISCONNECT
+// - CREATE_OBJECT / CLOSE_OBJECT (current input/output + new output screen buffers)
+// - RAW_FLUSH returns success
+// - USER_DEFINED: a growing subset needed by classic console clients:
+//   - Get/SetMode, GetCP/SetCP, GetNumberOfInputEvents
+//   - WriteConsole / ReadConsole (byte passthrough + UTF-16 -> UTF-8 for output)
+//   - Screen buffer state (Get/SetCursorInfo, SetCursorPosition, Get/SetScreenBufferInfo,
+//     SetTextAttribute, SetScreenBufferSize, GetLargestWindowSize, SetWindowInfo)
+//   - Output buffer contents (FillConsoleOutput, Read/WriteConsoleOutputString, Read/WriteConsoleOutput)
+//   - ScrollConsoleScreenBuffer and Get/SetTitle
+// - other operations are rejected with STATUS_NOT_IMPLEMENTED
+//
+// See also:
+// - `new/docs/conhost_behavior_imitation_matrix.md`
+// - `new/docs/design/condrv_raw_io_parity.md`
+// - `new/tests/condrv_server_dispatch_tests.cpp` (large unit-test suite)
 
 #include "condrv/condrv_api_message.hpp"
 #include "condrv/condrv_device_comm.hpp"

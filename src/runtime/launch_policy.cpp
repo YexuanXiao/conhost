@@ -1,5 +1,13 @@
 #include "runtime/launch_policy.hpp"
 
+// The legacy policy is intentionally small:
+// - ForceV2 is read from `HKCU\\Console\\ForceV2` (DWORD, default enabled).
+// - `-ForceV1` overrides and routes to legacy conhost (unless ConPTY mode is
+//   requested, where legacy cannot host the pseudo console path).
+//
+// This mirrors the observable policy behavior without porting the entire set of
+// historical conhost feature flags.
+
 namespace oc::runtime
 {
     std::expected<bool, LaunchPolicyError> LaunchPolicy::read_force_v2_registry() noexcept
@@ -68,4 +76,3 @@ namespace oc::runtime
         };
     }
 }
-

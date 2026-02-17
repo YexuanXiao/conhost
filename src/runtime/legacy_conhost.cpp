@@ -1,5 +1,15 @@
 #include "runtime/legacy_conhost.hpp"
 
+// The legacy inbox conhost exposes a private entrypoint in `ConhostV1.dll` that
+// starts the legacy IO thread for a given ConDrv server handle. This file
+// provides the minimal glue needed to call that entrypoint when the selection
+// policy requests legacy behavior.
+//
+// Note:
+// - The replacement intentionally does not unload `ConhostV1.dll` after
+//   activation. The legacy IO thread lives inside the DLL, so unloading would
+//   be unsafe.
+
 namespace oc::runtime
 {
     std::expected<void, LegacyConhostError> LegacyConhost::activate(const core::HandleView server_handle) noexcept

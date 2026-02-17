@@ -10,6 +10,19 @@
 //
 // This module reads that pipe on a dedicated Win32 thread and dispatches decoded
 // packets to an injected target interface.
+//
+// Threading model:
+// - `start(...)` duplicates the read handle and spawns a Win32 thread.
+// - The worker thread performs a simple packet decode loop.
+// - `stop_and_join()` sets a private stop event and then waits for the thread.
+//
+// Why we poll `PeekNamedPipe` instead of blocking forever:
+// - The pipe handle is not reliably cancelable in all environments with
+//   `CancelSynchronousIo` alone (and cancellation races are inevitable).
+// - A short poll interval keeps the implementation deterministic and allows
+//   shutdown without relying on the writer closing the pipe.
+//
+// See also: `core/host_signals.hpp` for the on-the-wire packet layout.
 
 #include "core/handle_view.hpp"
 #include "core/unique_handle.hpp"

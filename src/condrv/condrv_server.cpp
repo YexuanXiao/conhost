@@ -19,6 +19,26 @@
 #include <span>
 #include <vector>
 
+// `condrv/condrv_server.cpp` implements the classic ConDrv server loop used for
+// `--server` startup.
+//
+// The core loop is structured to match the observable behavior of the inbox
+// conhost IO thread:
+// - Block on `IOCTL_CONDRV_READ_IO` to receive the next driver request.
+// - Dispatch the request to the in-memory console model (`ServerState`,
+//   `ScreenBuffer`, input queue, etc.).
+// - Complete the request back to the driver (including output buffer writes).
+//
+// Key behavioral compatibility points:
+// - Reply-pending: input-dependent operations do not block the loop; they return
+//   `reply_pending=true` and are retried later (see
+//   `new/docs/design/condrv_reply_pending_wait_queue.md`).
+// - Shutdown signaling: the server may be asked to stop via a waitable event
+//   (or, in ConPTY startups, an event derived from a signal pipe monitor).
+//
+// The implementation intentionally keeps raw HANDLE usage localized and relies
+// on move-only RAII wrappers (`core::UniqueHandle`) for ownership safety.
+
 namespace oc::condrv
 {
     namespace
@@ -63,6 +83,10 @@ namespace oc::condrv
 
         DWORD WINAPI signal_monitor_thread(void* param)
         {
+            // This helper thread exists solely because the server thread blocks
+            // in `IOCTL_CONDRV_READ_IO`. When an external stop is requested, we
+            // set `stop_requested=true` and cancel the server thread's
+            // synchronous device IO so it can observe the flag and exit.
             auto* context = static_cast<SignalMonitorContext*>(param);
             if (context == nullptr || context->stop_requested == nullptr)
             {
@@ -347,6 +371,14 @@ namespace oc::condrv
 
         DWORD WINAPI input_monitor_thread(void* param)
         {
+            // Host input monitor:
+            // - Reads from the host-side input byte stream (typically a pipe).
+            // - Appends bytes into the in-memory `InputQueue`.
+            // - If the ConDrv server thread is blocked inside `READ_IO` *and*
+            //   there are reply-pending requests, cancel that device read so
+            //   the server can retry pending requests promptly.
+            //
+            // See `new/docs/design/condrv_reply_pending_wait_queue.md`.
             auto* context = static_cast<InputMonitorContext*>(param);
             if (context == nullptr || context->queue == nullptr || context->stop_requested == nullptr)
             {
@@ -354,6 +386,10 @@ namespace oc::condrv
             }
 
             const auto maybe_wake_server = [&]() noexcept {
+                // Best-effort wake: `CancelSynchronousIo` targets the server
+                // thread's `IOCTL_CONDRV_READ_IO` call. Guard usage to the
+                // intended "pending replies exist and server is currently
+                // reading" case to avoid canceling unrelated synchronous IO.
                 if (!context->target_thread ||
                     context->has_pending_replies == nullptr ||
                     context->in_driver_read_io == nullptr)

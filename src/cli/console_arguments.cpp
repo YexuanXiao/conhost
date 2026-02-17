@@ -11,6 +11,18 @@
 #include <string>
 #include <vector>
 
+// Parsing strategy:
+// - Preserve upstream behavior where host options are parsed only up to the
+//   beginning of the client payload.
+// - Once we reach the client payload boundary (`--` or first unknown token),
+//   the remaining tokens are treated as client tokens and are not interpreted
+//   as host flags, even if they resemble known switches.
+// - Reconstruct the child command line using Win32 escaping rules so
+//   `CreateProcessW` receives equivalent tokenization.
+//
+// See `new/docs/design/cli_command_line_reconstruction.md` for details and
+// `new/tests/console_arguments_tests.cpp` for round-trip coverage.
+
 namespace oc::cli
 {
     namespace

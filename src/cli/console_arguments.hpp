@@ -1,5 +1,22 @@
 #pragma once
 
+// CLI parser for `openconsole_new`.
+//
+// This type implements a compatibility-focused subset of the upstream
+// OpenConsole argument parsing behavior:
+// - `CommandLineToArgvW` is used to match Win32 tokenization rules.
+// - Host/runtime switches are consumed from left to right.
+// - The remaining tail is treated as the *client command line* payload, either:
+//   - explicitly after `--`, or
+//   - implicitly starting at the first unknown token.
+//
+// The client payload is reconstructed into a single `CreateProcessW` command
+// line string using Win32 escaping rules so that a downstream parse yields the
+// original tokens. See `new/docs/design/cli_command_line_reconstruction.md`.
+//
+// This module is "pure": it performs no process/session side effects.
+// See `new/docs/conhost_module_partition.md` for module boundaries.
+
 #include "core/handle_view.hpp"
 
 #include <cstdint>

@@ -10,6 +10,20 @@
 #include <limits>
 #include <span>
 
+// Implementation notes:
+// - The host-signal pipe payloads are packed POD structs whose layout must match
+//   the upstream OpenConsole contract (see `core/host_signals.hpp`).
+// - All reads are performed on the dedicated thread. The owning `HostSignalInputThread`
+//   instance never performs pipe I/O directly.
+// - Shutdown is cooperative: we signal a private stop event and the worker thread
+//   observes it between `PeekNamedPipe` polls.
+//
+// This module is intentionally resilient:
+// - Pipe disconnect is treated as a normal terminal condition and triggers
+//   `HostSignalTarget::signal_pipe_disconnected()`.
+// - Unknown codes are ignored after draining the declared payload size so the
+//   stream can continue.
+
 namespace oc::runtime
 {
     namespace

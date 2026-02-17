@@ -28,6 +28,37 @@
 #include <string_view>
 #include <vector>
 
+// `runtime/session.cpp` is the central runtime implementation for `openconsole_new`.
+//
+// High-level responsibilities (see `new/docs/architecture.md`):
+// - Create-server ("EXE mode") startup:
+//   - Choose legacy vs replacement behavior (LaunchPolicy) (in `Application`).
+//   - Create a console server instance (ConDrv) and launch the requested client.
+//   - If requested/necessary, host the client under a pseudo console (ConPTY),
+//     forwarding bytes between the host and the client.
+// - Server-handle ("--server") startup:
+//   - Validate the inherited server/signal handles.
+//   - Host the ConDrv server loop (`condrv::ConDrvServer`) either:
+//     - with a classic window renderer (interactive), or
+//     - in headless mode with host I/O pipes.
+// - Default-terminal delegation (windowed "--server"):
+//   - Probe `HKCU\\Console\\%%Startup\\DelegationConsole` for an out-of-proc COM
+//     handler implementing `IConsoleHandoff`.
+//   - If delegation succeeds, do not create a classic window. Instead, remain
+//     alive for PID continuity and relay privileged host-control requests from
+//     the delegated UI host via a "host signal" pipe.
+//
+// The implementation mirrors the upstream structure but is intentionally split
+// into small, testable pieces (RAII wrappers, no raw HANDLE ownership in call
+// sites). It is acceptable for the replacement to omit some of the upstream's
+// historical workarounds as long as observable behavior remains compatible on
+// Windows 10/11.
+//
+// See also:
+// - `new/docs/conhost_source_architecture.md`
+// - `new/docs/conhost_module_partition.md`
+// - `new/docs/conhost_behavior_imitation_matrix.md`
+
 namespace oc::runtime
 {
     namespace
@@ -1687,6 +1718,20 @@ namespace oc::runtime
 
         std::expected<DWORD, SessionError> Session::run(const SessionOptions& options, logging::Logger& logger) noexcept
         {
+        // `Session::run` is intentionally a single, explicit decision tree.
+        //
+        // The upstream conhost implementation has a comparable "routing" role
+        // (EXE mode vs --server vs -Embedding, ConPTY vs classic, etc.). Here we
+        // keep the branching readable by:
+        // - validating inherited handles up-front,
+        // - keeping each branch in a compact helper (`run_with_pseudoconsole`,
+        //   `run_windowed_server`, `run_with_inherited_stdio`),
+        // - storing only the small pieces of state that need to survive across
+        //   fallbacks (for example `initial_packet` when we already consumed a
+        //   `READ_IO` during a delegation probe).
+        //
+        // See `new/docs/conhost_behavior_imitation_matrix.md` for the current
+        // parity status of each startup mode.
         if (!options.create_server_handle)
         {
             auto server_result = ServerHandleValidator::validate(options.server_handle);
@@ -1710,6 +1755,12 @@ namespace oc::runtime
 
         if (!options.create_server_handle)
         {
+            // Classic conhost server-handle startup: the OS or a parent process
+            // already created the ConDrv server object and started us with
+            // `--server 0x...`.
+            //
+            // This mode is used both for classic windowed hosting and for
+            // headless hosting behind a third-party terminal.
             if (!options.client_command_line.empty())
             {
                 logger.log(
@@ -1720,6 +1771,12 @@ namespace oc::runtime
 
             if (!options.headless && !options.in_conpty_mode)
             {
+                // Windowed server hosting. Before creating a classic window,
+                // attempt default-terminal delegation ("defterm") so a third-
+                // party UI host can take over interactive rendering.
+                //
+                // Upstream reference: `src/server/IoDispatchers.cpp::attemptHandoff`.
+                // See also: `new/docs/conhost_behavior_imitation_matrix.md`.
                 std::optional<condrv::IoPacket> initial_packet;
                 core::UniqueHandle input_available_event;
 
@@ -1736,6 +1793,10 @@ namespace oc::runtime
                     }
                     else if (delegation_target->has_value())
                     {
+                        // The driver expects the server to provide an event that
+                        // clients implicitly wait on when input is unavailable.
+                        // This is a manual-reset event because multiple clients
+                        // can be unblocked by a single input arrival.
                         auto input_event = core::create_event(true, false, nullptr);
                         if (!input_event)
                         {
@@ -1758,6 +1819,8 @@ namespace oc::runtime
                             }
                             else
                             {
+                                // Register the input event with the driver so
+                                // clients can observe input availability.
                                 if (auto server_info = comm->set_server_information(input_available_event.view()); !server_info)
                                 {
                                     logger.log(
@@ -1768,6 +1831,14 @@ namespace oc::runtime
                                 }
                                 else
                                 {
+                                    // Read the first driver IO packet now:
+                                    // - Delegation needs a "portable attach"
+                                    //   message (identifier + process/object).
+                                    // - If delegation fails, we must still
+                                    //   process this packet in our own server
+                                    //   loop. We stash it in `initial_packet`
+                                    //   so the windowed server thread can start
+                                    //   with the already-consumed message.
                                     condrv::IoPacket packet{};
                                     if (auto read = comm->read_io(nullptr, packet); !read)
                                     {
@@ -1781,6 +1852,8 @@ namespace oc::runtime
                                     {
                                         initial_packet.emplace(packet);
 
+                                        // Minimal attach payload (stable fields only) used by
+                                        // `IConsoleHandoff::EstablishHandoff`.
                                         CONSOLE_PORTABLE_ATTACH_MSG attach{};
                                         attach.IdLowPart = packet.descriptor.identifier.LowPart;
                                         attach.IdHighPart = packet.descriptor.identifier.HighPart;
@@ -1790,6 +1863,12 @@ namespace oc::runtime
                                         attach.InputSize = packet.descriptor.input_size;
                                         attach.OutputSize = packet.descriptor.output_size;
 
+                                        // Host-signal pipe: delegated UI host writes requests (EndTask,
+                                        // NotifyApp, ...) and this inbox host reads and performs the
+                                        // privileged operations on its behalf.
+                                        //
+                                        // We pass the write end to the delegated host and keep the read
+                                        // end for ourselves.
                                         auto signal_pipe_pair = create_signal_pipe_pair();
                                         if (!signal_pipe_pair)
                                         {
@@ -1800,6 +1879,8 @@ namespace oc::runtime
                                         }
                                         else
                                         {
+                                            // Provide a real handle to this process. The delegated host
+                                            // can use it to detect when the inbox host has exited.
                                             auto inbox_process = core::duplicate_current_process(
                                                 PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
                                                 false);
@@ -1812,6 +1893,10 @@ namespace oc::runtime
                                             }
                                             else
                                             {
+                                                // Perform the actual COM handoff. On success, COM returns
+                                                // a handle to the delegated host process so we can wait
+                                                // for it and keep PID continuity for clients that expect
+                                                // the original host process to remain alive.
                                                 auto delegated_process = invoke_console_handoff(
                                                     delegation_target->value(),
                                                     options.server_handle,
@@ -1897,6 +1982,9 @@ namespace oc::runtime
                                                         resolve_rtl_nt_status_to_dos_error(),
                                                         client_pid);
 
+                                                    // Start the host-signal reader thread. It duplicates the
+                                                    // pipe handle, so it remains valid even if we reset our
+                                                    // local `read_end` wrapper.
                                                     auto signal_input = HostSignalInputThread::start(
                                                         signal_pipe_pair->read_end.view(),
                                                         signal_target,
@@ -1918,6 +2006,15 @@ namespace oc::runtime
                                                     // Allow the delegated host to observe pipe closure when it exits.
                                                     signal_pipe_pair->write_end.reset();
 
+                                                    // Important: wait only on the delegated host process.
+                                                    //
+                                                    // Waiting on other objects associated with the console
+                                                    // server handle (for example server-relative files) is
+                                                    // fragile because they may be waitable and already in
+                                                    // the signaled state immediately after opening, which
+                                                    // would cause this process to exit too early and tear
+                                                    // down the server. The inbox conhost waits only on the
+                                                    // returned process handle for the successful handoff.
                                                     const DWORD wait_result = ::WaitForSingleObject(delegated_process->get(), INFINITE);
                                                     if (wait_result != WAIT_OBJECT_0)
                                                     {
@@ -1971,10 +2068,16 @@ namespace oc::runtime
                 const DWORD signal_type = ::GetFileType(options.signal_handle.get());
                 if (signal_type == FILE_TYPE_PIPE)
                 {
-                    // ConPTY/server-handle startup uses a pipe as the "--signal" channel. Waiting on
-                    // that handle directly is incorrect because it becomes signaled when bytes are
-                    // available (not only on disconnect). Drain it on a helper thread and convert
-                    // broken-pipe into an explicit stop event.
+                    // In ConPTY/server-handle startup (commonly referred to as "0x4" in upstream),
+                    // the `--signal` handle is a pipe. It is *not* a waitable shutdown event.
+                    //
+                    // A pipe becomes signaled when data is available, so passing the pipe handle
+                    // into a wait set would spuriously request shutdown as soon as the hosting
+                    // terminal writes any bytes. Instead, we drain the pipe on a helper thread
+                    // and translate "disconnect" (broken pipe / EOF) into an explicit manual-
+                    // reset event that the ConDrv server loop can wait on.
+                    //
+                    // See `new/src/runtime/signal_pipe_monitor.*` for details and tests.
                     if (auto created = core::create_event(true, false, nullptr))
                     {
                         stop_event = std::move(created.value());

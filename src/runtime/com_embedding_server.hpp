@@ -1,5 +1,23 @@
 #pragma once
 
+// COM local-server implementation for `-Embedding`.
+//
+// Upstream OpenConsole uses `-Embedding` to register a local COM server that
+// exposes `IConsoleHandoff`. The in-box console host can activate that COM
+// server and pass ownership of a console session (ConDrv server handle + attach
+// message) to the out-of-box console host.
+//
+// In this replacement:
+// - `ComEmbeddingServer::run(...)` registers the class object for a single
+//   handoff, waits for `IConsoleHandoff::EstablishHandoff`, duplicates the
+//   incoming handles into this process, and then starts the ConDrv server loop
+//   (`condrv::ConDrvServer::run_with_handoff`) to service the session.
+//
+// See also:
+// - `generated/IConsoleHandoff.h` (IDL-generated interface definition)
+// - `new/docs/conhost_source_architecture.md`
+// - `new/docs/conhost_behavior_imitation_matrix.md`
+
 #include "core/handle_view.hpp"
 #include "logging/logger.hpp"
 
@@ -13,6 +31,8 @@ namespace oc::runtime
 {
     struct PortableAttachMessage final
     {
+        // Portable subset of the driver connect message descriptor. The layout
+        // intentionally mirrors `CONSOLE_PORTABLE_ATTACH_MSG` from the IDL.
         std::uint32_t IdLowPart{};
         std::int32_t IdHighPart{};
         std::uint64_t Process{};
@@ -24,6 +44,9 @@ namespace oc::runtime
 
     struct ComHandoffPayload final
     {
+        // Handles received from the inbox host. These values are duplicated
+        // into this process before being stored here, so the caller may assume
+        // they remain valid for the duration of the session.
         core::HandleView server_handle{};
         core::HandleView input_event{};
         core::HandleView signal_pipe{};

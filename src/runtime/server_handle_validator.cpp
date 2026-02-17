@@ -3,6 +3,14 @@
 #include "core/unique_handle.hpp"
 #include "core/win32_handle.hpp"
 
+// The upstream conhost code uses NT object manager queries and/or private
+// contracts to validate ConDrv handles. The replacement prefers supported Win32
+// mechanisms (`GetHandleInformation`, `DuplicateHandle`, `GetFileType`) so the
+// validation logic remains stable across Windows 10/11 builds.
+//
+// Validation here is intentionally shallow: deeper semantic checks belong in
+// the ConDrv communication layer (where errors can be logged with context).
+
 namespace oc::runtime
 {
     namespace

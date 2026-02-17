@@ -16,10 +16,36 @@
 #include <atomic>
 #include <string_view>
 
+// `runtime/com_embedding_server.cpp` implements the out-of-proc COM local server
+// for `-Embedding` startup.
+//
+// Responsibilities:
+// - Register the `IConsoleHandoff` class object (single-use).
+// - Receive an inbox-to-out-of-box handoff (`EstablishHandoff`):
+//   - ConDrv server handle
+//   - input-availability event (driver-registered)
+//   - host-signal pipe (delegated host -> inbox host privileged requests)
+//   - inbox process handle (for lifetime tracking)
+//   - portable attach message (identifier + process/object + buffer sizes)
+// - Run the ConDrv server loop with the provided initial packet so the client
+//   connection that triggered the handoff is properly completed.
+//
+// Tests:
+// - Unit tests validate COM registration and handle duplication.
+// - Integration tests validate out-of-proc activation and a round-trip
+//   `EstablishHandoff` call using a generated proxy/stub DLL.
+//
+// See also:
+// - `new/docs/conhost_behavior_imitation_matrix.md`
+// - `new/tests/com_embedding_integration_tests.cpp`
+
 namespace oc::runtime
 {
     namespace
     {
+        // The embedding server accepts exactly one handoff and then exits.
+        // This mirrors how upstream OpenConsole uses `REGCLS_SINGLEUSE` and
+        // keeps lifecycle predictable for the inbox host.
         enum class HandoffCompletionState : LONG
         {
             pending = 0,
@@ -127,6 +153,9 @@ namespace oc::runtime
                     return E_POINTER;
                 }
 
+                // Register as "single use": COM will revoke the class object
+                // after one successful activation, which matches the desired
+                // console handoff contract.
                 const HRESULT hr = ::CoRegisterClassObject(
                     kClsidConsoleHandoff,
                     class_factory,
@@ -163,6 +192,9 @@ namespace oc::runtime
             {
             }
 
+            // The inbox host may call `EstablishHandoff` only once. Guard the
+            // implementation so test harnesses and unexpected COM retries do
+            // not corrupt state.
             [[nodiscard]] bool try_begin_establish() noexcept
             {
                 bool expected = false;
@@ -198,6 +230,10 @@ namespace oc::runtime
                 const core::HandleView signal_pipe,
                 const core::HandleView inbox_process) noexcept
             {
+                // `EstablishHandoff` provides handles that may not be safe to
+                // close by the caller (they are owned by the COM server). We
+                // duplicate them into this process so ownership is explicit
+                // and the COM method can return promptly.
                 const auto duplicate = [](const core::HandleView in, core::UniqueHandle& out) noexcept -> HRESULT {
                     if (!in)
                     {

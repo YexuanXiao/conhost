@@ -13,6 +13,18 @@
 #include <cwchar>
 #include <utility>
 
+// Minimal classic-window host (non-WinUI).
+//
+// This window host exists for the "classic" interactive server-handle startup
+// path where `openconsole_new` renders the screen buffer itself instead of
+// delegating to an external terminal. It is intentionally small:
+// - snapshot-based rendering (`PublishedScreenBuffer` -> paint thread),
+// - basic text output (currently monochrome),
+// - no selection/scrollbars/IME/accessibility parity yet.
+//
+// See `new/docs/design/renderer_window_host.md` for current scope and planned
+// follow-ups.
+
 namespace oc::renderer
 {
     struct WindowHost::DeviceResources final
