@@ -388,6 +388,9 @@
   - CUP (`CSI H`/`CSI f`) and vertical cursor motion now use origin-mode-relative addressing and clamp within DECSTBM margins.
   - cursor save/restore includes origin mode.
   - added deterministic unit tests and a dedicated design doc.
+- Hardened server-handle startup shutdown semantics:
+  - `--server` + default-terminal delegation now waits only on the process handle returned by `IConsoleHandoff::EstablishHandoff` (matching upstream inbox conhost) to avoid premature exits from waitable file handles.
+  - ConPTY-style `--signal` pipes are no longer treated as waitable stop events; `SignalPipeMonitor` drains them and converts disconnection into an explicit stop event for the ConDrv server loop.
 
 ## Next Milestone
 

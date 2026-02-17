@@ -21,6 +21,7 @@ add_executable(oc_new_tests
     condrv_vt_fuzz_tests.cpp
     dwrite_text_measurer_tests.cpp
     process_integration_tests.cpp
+    signal_pipe_monitor_tests.cpp
 )
 
 find_program(OC_NEW_MIDL_EXE midl.exe REQUIRED)
