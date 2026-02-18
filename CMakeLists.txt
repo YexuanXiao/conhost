@@ -6,6 +6,8 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+option(OC_NEW_ENABLE_ASAN "Enable AddressSanitizer for MSVC (cl.exe) builds" OFF)
+
 add_library(oc_new_core STATIC
     src/app/application.cpp
     src/cli/console_arguments.cpp
@@ -99,3 +101,35 @@ endif()
 
 enable_testing()
 add_subdirectory(tests)
+
+if(OC_NEW_ENABLE_ASAN)
+    if(MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+        if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+            function(oc_new_enable_msvc_asan target_name)
+                if(NOT TARGET ${target_name})
+                    message(FATAL_ERROR "OC_NEW_ENABLE_ASAN expected target '${target_name}' to exist")
+                endif()
+
+                target_compile_options(${target_name} PRIVATE /fsanitize=address)
+                if(TARGET ${target_name} AND (TARGET ${target_name}))
+                    get_target_property(target_type ${target_name} TYPE)
+                    if(NOT target_type STREQUAL "STATIC_LIBRARY")
+                        target_link_options(${target_name} PRIVATE /fsanitize=address /INCREMENTAL:NO)
+                    endif()
+                endif()
+            endfunction()
+
+            oc_new_enable_msvc_asan(oc_new_core)
+            oc_new_enable_msvc_asan(openconsole_new)
+            oc_new_enable_msvc_asan(oc_new_tests)
+            oc_new_enable_msvc_asan(oc_new_embedding_test_host)
+            oc_new_enable_msvc_asan(oc_new_stdio_probe)
+            oc_new_enable_msvc_asan(oc_new_condrv_client_smoke)
+            oc_new_enable_msvc_asan(oc_new_condrv_client_input_events)
+        else()
+            message(WARNING "OC_NEW_ENABLE_ASAN requested, but MSVC AddressSanitizer requires a 64-bit build.")
+        endif()
+    else()
+        message(WARNING "OC_NEW_ENABLE_ASAN requested, but MSVC AddressSanitizer is supported only when using cl.exe.")
+    endif()
+endif()

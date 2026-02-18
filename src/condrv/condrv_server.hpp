@@ -8758,22 +8758,22 @@ namespace oc::logging
             // CONNECT input contains a `CONSOLE_SERVER_MSG` payload. We only use the application name
             // for command history allocation; other fields are currently ignored.
             std::wstring_view app_name{};
+            CONSOLE_SERVER_MSG server_msg{};
             if (auto input = message.get_input_buffer())
             {
-                if (input->size() >= sizeof(CONSOLE_SERVER_MSG))
+                if (input->size() >= sizeof(server_msg))
                 {
-                    CONSOLE_SERVER_MSG data{};
-                    std::memcpy(&data, input->data(), sizeof(data));
+                    std::memcpy(&server_msg, input->data(), sizeof(server_msg));
 
-                    const size_t bytes = static_cast<size_t>(data.ApplicationNameLength);
+                    const size_t bytes = static_cast<size_t>(server_msg.ApplicationNameLength);
                     const bool aligned = (bytes % sizeof(wchar_t)) == 0;
-                    const bool within_buffer = bytes <= (sizeof(data.ApplicationName) - sizeof(wchar_t));
+                    const bool within_buffer = bytes <= (sizeof(server_msg.ApplicationName) - sizeof(wchar_t));
                     const size_t cch = aligned ? (bytes / sizeof(wchar_t)) : 0;
-                    const bool has_terminator = aligned && cch < std::size(data.ApplicationName) && data.ApplicationName[cch] == L'\0';
+                    const bool has_terminator = aligned && cch < std::size(server_msg.ApplicationName) && server_msg.ApplicationName[cch] == L'\0';
 
                     if (aligned && within_buffer && has_terminator)
                     {
-                        app_name = std::wstring_view(data.ApplicationName, cch);
+                        app_name = std::wstring_view(server_msg.ApplicationName, cch);
                     }
                 }
             }

@@ -392,7 +392,7 @@ namespace oc::condrv
             core::HandleView host_input{};
             core::HandleView target_thread{};
             InputQueue* queue{};
-            std::atomic_bool* stop_requested{};
+            std::atomic_bool stop_requested{ false };
             std::atomic_bool* has_pending_replies{};
             std::atomic_bool* in_driver_read_io{};
         };
@@ -408,7 +408,7 @@ namespace oc::condrv
             //
             // See `new/docs/design/condrv_reply_pending_wait_queue.md`.
             auto* context = static_cast<InputMonitorContext*>(param);
-            if (context == nullptr || context->queue == nullptr || context->stop_requested == nullptr)
+            if (context == nullptr || context->queue == nullptr)
             {
                 return 0;
             }
@@ -439,7 +439,7 @@ namespace oc::condrv
             };
 
             std::array<std::byte, 4096> buffer{};
-            while (!context->stop_requested->load(std::memory_order_acquire))
+            while (!context->stop_requested.load(std::memory_order_acquire))
             {
                 DWORD read = 0;
                 if (::ReadFile(
@@ -451,7 +451,7 @@ namespace oc::condrv
                 {
                     const DWORD error = ::GetLastError();
                     if ((error == ERROR_OPERATION_ABORTED || error == ERROR_CANCELLED) &&
-                        context->stop_requested->load(std::memory_order_acquire))
+                        context->stop_requested.load(std::memory_order_acquire))
                     {
                         break;
                     }
@@ -492,28 +492,8 @@ namespace oc::condrv
             InputMonitor(const InputMonitor&) = delete;
             InputMonitor& operator=(const InputMonitor&) = delete;
 
-            InputMonitor(InputMonitor&& other) noexcept :
-                _thread(std::move(other._thread)),
-                _context(std::move(other._context)),
-                _stop_requested(other._stop_requested.load(std::memory_order_acquire))
-            {
-                other._context = nullptr;
-                other._stop_requested.store(true, std::memory_order_release);
-            }
-
-            InputMonitor& operator=(InputMonitor&& other) noexcept
-            {
-                if (this != &other)
-                {
-                    stop_and_join();
-                    _thread = std::move(other._thread);
-                    _context = std::move(other._context);
-                    _stop_requested.store(other._stop_requested.load(std::memory_order_acquire), std::memory_order_release);
-                    other._context = nullptr;
-                    other._stop_requested.store(true, std::memory_order_release);
-                }
-                return *this;
-            }
+            InputMonitor(InputMonitor&&) noexcept = default;
+            InputMonitor& operator=(InputMonitor&&) noexcept = default;
 
             [[nodiscard]] static std::expected<InputMonitor, ServerError> start(
                 const core::HandleView host_input,
@@ -541,7 +521,6 @@ namespace oc::condrv
                 context->host_input = host_input;
                 context->target_thread = target_thread;
                 context->queue = &queue;
-                context->stop_requested = &monitor._stop_requested;
                 context->has_pending_replies = &has_pending_replies;
                 context->in_driver_read_io = &in_driver_read_io;
 
@@ -565,7 +544,10 @@ namespace oc::condrv
         private:
             void stop_and_join() noexcept
             {
-                _stop_requested.store(true, std::memory_order_release);
+                if (_context)
+                {
+                    _context->stop_requested.store(true, std::memory_order_release);
+                }
 
                 if (_thread.valid())
                 {
@@ -580,7 +562,6 @@ namespace oc::condrv
 
             core::UniqueHandle _thread;
             std::unique_ptr<InputMonitorContext> _context;
-            std::atomic_bool _stop_requested{ false };
         };
 
         class HostIo final
