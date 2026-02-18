@@ -245,7 +245,7 @@ if ($Uninstall) {
     $handoffServerKey = "Software\Classes\CLSID\$ConsoleHandoffClsid\LocalServer32"
     $existing = Get-RegistryDefaultValue -SubKeyPath $handoffServerKey
     if ($null -ne $existing) {
-        $looksLikeOurs = ($existing -like '*openconsole_new.exe*')
+        $looksLikeOurs = ($existing -like '*openconsole_new.exe*') -or ($existing -like '*conhost.exe*')
         if ($looksLikeOurs) {
             if ($PSCmdlet.ShouldProcess("HKCU\\Software\\Classes\\CLSID\\$ConsoleHandoffClsid", 'Delete subtree')) {
                 Remove-RegistrySubTree -SubKeyPath "Software\Classes\CLSID\$ConsoleHandoffClsid"

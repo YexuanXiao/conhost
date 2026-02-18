@@ -248,7 +248,27 @@ namespace oc::runtime
         (void)(*window)->run();
 
         (void)::SetEvent(stop_event->get());
-        (void)::WaitForSingleObject(server_thread.get(), INFINITE);
+        // Ensure the ConDrv worker thread unblocks from `IOCTL_CONDRV_READ_IO`
+        // promptly on window close.
+        (void)::CancelSynchronousIo(server_thread.get());
+        if (payload.server_handle)
+        {
+            (void)::CancelIoEx(payload.server_handle.get(), nullptr);
+        }
+
+        constexpr DWORD worker_shutdown_timeout_ms = 5'000;
+        const DWORD wait_result = ::WaitForSingleObject(server_thread.get(), worker_shutdown_timeout_ms);
+        if (wait_result == WAIT_TIMEOUT)
+        {
+            logger.log(logging::LogLevel::error, L"Delegated ConDrv window worker did not exit within {}ms; forcing process exit", worker_shutdown_timeout_ms);
+            ::ExitProcess(ERROR_TIMEOUT);
+        }
+        if (wait_result != WAIT_OBJECT_0)
+        {
+            const DWORD error = ::GetLastError();
+            logger.log(logging::LogLevel::error, L"WaitForSingleObject failed for delegated ConDrv window worker (error={}); forcing process exit", error);
+            ::ExitProcess(error == 0 ? ERROR_GEN_FAILURE : error);
+        }
 
         if (signal_bridge_thread.valid())
         {
@@ -271,4 +291,3 @@ namespace oc::runtime
         });
     }
 }
-

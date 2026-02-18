@@ -64,10 +64,22 @@ namespace oc::condrv
 
         [[nodiscard]] std::expected<core::UniqueHandle, ServerError> duplicate_current_thread() noexcept
         {
-            auto duplicated = core::duplicate_current_thread();
+            // `CancelSynchronousIo` requires a thread handle with `THREAD_TERMINATE`.
+            // Do not rely on pseudo-handle duplication defaulting to sufficient rights.
+            constexpr DWORD desired_access = THREAD_TERMINATE | THREAD_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
+
+            auto duplicated = core::duplicate_current_thread(desired_access, false, 0);
             if (!duplicated)
             {
-                return std::unexpected(make_error(L"DuplicateHandle failed for current thread", duplicated.error()));
+                // Best-effort fallback: some environments may reject explicit
+                // access masks for duplicated pseudo handles.
+                auto same_access = core::duplicate_current_thread();
+                if (!same_access)
+                {
+                    return std::unexpected(make_error(L"DuplicateHandle failed for current thread", same_access.error()));
+                }
+
+                return std::move(same_access.value());
             }
 
             return std::move(duplicated.value());
@@ -75,6 +87,7 @@ namespace oc::condrv
 
         struct SignalMonitorContext final
         {
+            core::HandleView condrv_server{};
             core::HandleView signal_handle{};
             core::HandleView stop_event{};
             core::HandleView target_thread{};
@@ -101,7 +114,20 @@ namespace oc::condrv
             if (result == WAIT_OBJECT_0)
             {
                 context->stop_requested->store(true, std::memory_order_release);
-                ::CancelSynchronousIo(context->target_thread.get());
+
+                // The ConDrv server loop is driven by synchronous `DeviceIoControl`
+                // calls, primarily `IOCTL_CONDRV_READ_IO`. Some environments do not
+                // reliably cancel those calls via `CancelSynchronousIo` alone, so we
+                // also issue a handle-scoped `CancelIoEx` against the duplicated ConDrv
+                // server handle.
+                //
+                // Both calls are best-effort: cancellation is only a wake mechanism,
+                // and the server loop will observe `stop_requested` and exit.
+                (void)::CancelSynchronousIo(context->target_thread.get());
+                if (context->condrv_server)
+                {
+                    (void)::CancelIoEx(context->condrv_server.get(), nullptr);
+                }
             }
 
             return 0;
@@ -143,6 +169,7 @@ namespace oc::condrv
             }
 
             [[nodiscard]] static std::expected<SignalMonitor, ServerError> start(
+                const core::HandleView condrv_server,
                 const core::HandleView signal_handle,
                 std::atomic_bool& stop_requested) noexcept
             {
@@ -175,6 +202,7 @@ namespace oc::condrv
                 context->signal_handle = signal_handle;
                 context->stop_event = stop_event->view();
                 context->target_thread = target_thread->view();
+                context->condrv_server = condrv_server;
                 context->stop_requested = &stop_requested;
 
                 core::UniqueHandle thread(::CreateThread(
@@ -890,7 +918,7 @@ namespace oc::condrv
             logger.log(logging::LogLevel::info, L"ConDrv server loop starting");
 
             std::atomic_bool stop_requested{ false };
-            auto signal_monitor = SignalMonitor::start(signal_handle, stop_requested);
+            auto signal_monitor = SignalMonitor::start(comm->server_handle(), signal_handle, stop_requested);
             if (!signal_monitor)
             {
                 return std::unexpected(signal_monitor.error());

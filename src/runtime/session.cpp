@@ -1047,7 +1047,31 @@ namespace oc::runtime
             (void)(*window)->run();
 
             (void)::SetEvent(stop_event->get());
-            (void)::WaitForSingleObject(server_thread.get(), INFINITE);
+            // The ConDrv worker thread spends most of its time blocked in a synchronous
+            // `IOCTL_CONDRV_READ_IO`. Ensure the stop request is observed promptly even
+            // if the worker's internal signal monitor is unavailable or delayed.
+            (void)::CancelSynchronousIo(server_thread.get());
+            if (options.server_handle)
+            {
+                (void)::CancelIoEx(options.server_handle.get(), nullptr);
+            }
+
+            constexpr DWORD worker_shutdown_timeout_ms = 5'000;
+            const DWORD wait_result = ::WaitForSingleObject(server_thread.get(), worker_shutdown_timeout_ms);
+            if (wait_result == WAIT_TIMEOUT)
+            {
+                // This should not happen: closing the window must terminate the hosting process.
+                // If the worker thread does not exit, force termination rather than leaving a
+                // headless process behind.
+                logger.log(logging::LogLevel::error, L"ConDrv windowed server worker did not exit within {}ms; forcing process exit", worker_shutdown_timeout_ms);
+                ::ExitProcess(ERROR_TIMEOUT);
+            }
+            if (wait_result != WAIT_OBJECT_0)
+            {
+                const DWORD error = ::GetLastError();
+                logger.log(logging::LogLevel::error, L"WaitForSingleObject failed for ConDrv windowed server worker (error={}); forcing process exit", error);
+                ::ExitProcess(error == 0 ? ERROR_GEN_FAILURE : error);
+            }
 
             if (signal_bridge_thread.valid())
             {
