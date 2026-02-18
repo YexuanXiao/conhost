@@ -1294,7 +1294,7 @@ namespace oc::logging
                 }
             }
 
-            return { 0, static_cast<SHORT>(buffer_size.Y - 1) };
+            return { SHORT{ 0 }, static_cast<SHORT>(buffer_size.Y - 1) };
         };
 
         const auto scroll_region_up = [&](const SHORT top, const SHORT bottom, unsigned count) noexcept {
@@ -6541,11 +6541,11 @@ namespace oc::logging
                     while (records_written < capacity && offset < byte_count)
                     {
                         vt_input::DecodedToken token{};
-                        const auto outcome = decode_one_input_token(
+                        const auto decode_outcome = decode_one_input_token(
                             code_page,
                             std::span<const std::byte>(input_bytes.data() + offset, byte_count - offset),
                             token);
-                        if (outcome == InputDecodeOutcome::need_more_data)
+                        if (decode_outcome == InputDecodeOutcome::need_more_data)
                         {
                             break;
                         }

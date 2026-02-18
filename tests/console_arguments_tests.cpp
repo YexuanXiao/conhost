@@ -319,9 +319,11 @@ namespace
         {
             return value == expected;
         }
-
-        // 32-bit builds can't represent a >32-bit handle value.
-        return value != expected;
+        else
+        {
+            // 32-bit builds can't represent a >32-bit handle value.
+            return value != expected;
+        }
     }
 }
 

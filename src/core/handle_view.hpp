@@ -27,7 +27,7 @@ namespace oc::core
         {
         }
 
-        [[nodiscard]] static constexpr HandleView from_uintptr(const std::uintptr_t value) noexcept
+        [[nodiscard]] static HandleView from_uintptr(const std::uintptr_t value) noexcept
         {
             return HandleView(reinterpret_cast<HANDLE>(value));
         }
@@ -37,7 +37,7 @@ namespace oc::core
             return _value;
         }
 
-        [[nodiscard]] constexpr std::uintptr_t as_uintptr() const noexcept
+        [[nodiscard]] std::uintptr_t as_uintptr() const noexcept
         {
             return reinterpret_cast<std::uintptr_t>(_value);
         }

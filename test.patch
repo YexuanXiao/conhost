@@ -1,0 +1,212 @@
+diff --git a/c:\Users\xyx\Documents\OpenConsole\new/src/runtime/session.cpp b/c:\Users\xyx\Documents\OpenConsole\new/src/runtime/session.cpp
+--- a/c:\Users\xyx\Documents\OpenConsole\new/src/runtime/session.cpp
++++ b/c:\Users\xyx\Documents\OpenConsole\new/src/runtime/session.cpp
+@@ -81,11 +81,16 @@
+ {
+-    namespace
+-    {
+-        constexpr CLSID k_clsid_default{};
+-        constexpr CLSID k_clsid_conhost = {
+-            0xb23d10c0, 0xe52e, 0x411e, { 0x9d, 0x5b, 0xc0, 0x9f, 0xdf, 0x70, 0x9c, 0x7d }
+-        };
+-
+-        constexpr std::wstring_view k_startup_key = L"Console\\%%Startup";
+-        constexpr std::wstring_view k_delegation_console_value = L"DelegationConsole";
++    namespace
++    {
++        constexpr CLSID k_clsid_default{};
++        constexpr CLSID k_clsid_conhost = {
++            0xb23d10c0, 0xe52e, 0x411e, { 0x9d, 0x5b, 0xc0, 0x9f, 0xdf, 0x70, 0x9c, 0x7d }
++        };
++        // Default "Let Windows decide" target (Windows Terminal stable channel).
++        // Upstream reference: `src/propslib/DelegationConfig.hpp::CLSID_WindowsTerminalConsole`.
++        constexpr CLSID k_clsid_windows_terminal_console = {
++            0x2eaca947, 0x7f5f, 0x4cfa, { 0xba, 0x87, 0x8f, 0x7f, 0xbe, 0xef, 0xbe, 0x69 }
++        };
++
++        constexpr std::wstring_view k_startup_key = L"Console\\%%Startup";
++        constexpr std::wstring_view k_delegation_console_value = L"DelegationConsole";
+ 
+@@ -768,4 +773,24 @@
+ 
+-        [[nodiscard]] std::expected<std::optional<CLSID>, SessionError> resolve_console_handoff_clsid() noexcept
++        enum class ConsoleHandoffKind : unsigned char
+         {
++            // `DelegationConsole` missing or set to CLSID_Default (all zeros).
++            // The inbox host interprets this as "Let Windows decide" and attempts
++            // to use Windows Terminal by default (with a marker interface check).
++            default_or_missing,
++
++            // Explicit "Windows Console Host" selection (no delegation).
++            conhost,
++
++            // Explicit custom COM activation target.
++            custom,
++        };
++
++        struct ConsoleHandoffTarget final
++        {
++            ConsoleHandoffKind kind{ ConsoleHandoffKind::default_or_missing };
++            CLSID clsid{};
++        };
++
++        [[nodiscard]] std::expected<ConsoleHandoffTarget, SessionError> resolve_console_handoff_target() noexcept
++        {
+             enum class DelegationProbeOutcome : unsigned char
+@@ -773,3 +798,4 @@
+                 missing,
+-                no_delegation,
++                default_target,
++                conhost_target,
+                 delegation,
+@@ -872,7 +898,12 @@
+ 
+-                if (guid_equal(handoff_clsid, k_clsid_default) || guid_equal(handoff_clsid, k_clsid_conhost))
++                if (guid_equal(handoff_clsid, k_clsid_default))
+                 {
+-                    return DelegationProbeResult{ .outcome = DelegationProbeOutcome::no_delegation };
++                    return DelegationProbeResult{ .outcome = DelegationProbeOutcome::default_target };
+                 }
+ 
++                if (guid_equal(handoff_clsid, k_clsid_conhost))
++                {
++                    return DelegationProbeResult{ .outcome = DelegationProbeOutcome::conhost_target };
++                }
++
+                 return DelegationProbeResult{
+@@ -883,2 +914,25 @@
+ 
++            const auto map_to_target = [](const DelegationProbeResult& result) noexcept -> ConsoleHandoffTarget {
++                switch (result.outcome)
++                {
++                case DelegationProbeOutcome::delegation:
++                    return ConsoleHandoffTarget{
++                        .kind = ConsoleHandoffKind::custom,
++                        .clsid = result.clsid,
++                    };
++                case DelegationProbeOutcome::conhost_target:
++                    return ConsoleHandoffTarget{
++                        .kind = ConsoleHandoffKind::conhost,
++                        .clsid = k_clsid_conhost,
++                    };
++                case DelegationProbeOutcome::default_target:
++                case DelegationProbeOutcome::missing:
++                default:
++                    return ConsoleHandoffTarget{
++                        .kind = ConsoleHandoffKind::default_or_missing,
++                        .clsid = k_clsid_default,
++                    };
++                }
++            };
++
+             auto hkcu = probe(HKEY_CURRENT_USER);
+@@ -887,5 +941,5 @@
+                 auto hklm = probe(HKEY_LOCAL_MACHINE);
+-                if (hklm && hklm->outcome == DelegationProbeOutcome::delegation)
++                if (hklm)
+                 {
+-                    return hklm->clsid;
++                    return map_to_target(*hklm);
+                 }
+@@ -895,9 +949,5 @@
+ 
+-            if (hkcu->outcome == DelegationProbeOutcome::delegation)
+-            {
+-                return hkcu->clsid;
+-            }
+-            if (hkcu->outcome == DelegationProbeOutcome::no_delegation)
++            if (hkcu->outcome == DelegationProbeOutcome::delegation || hkcu->outcome == DelegationProbeOutcome::conhost_target)
+             {
+-                return std::optional<CLSID>{};
++                return map_to_target(*hkcu);
+             }
+@@ -910,16 +960,17 @@
+ 
+-            if (hklm->outcome == DelegationProbeOutcome::delegation)
++            if (hklm->outcome == DelegationProbeOutcome::delegation || hklm->outcome == DelegationProbeOutcome::conhost_target)
+             {
+-                return hklm->clsid;
++                return map_to_target(*hklm);
+             }
+ 
+-            return std::optional<CLSID>{};
++            return map_to_target(*hkcu);
+         }
+-
+-        [[nodiscard]] std::expected<core::UniqueHandle, SessionError> invoke_console_handoff(
+-            const CLSID& handoff_clsid,
+-            const core::HandleView server_handle,
+-            const core::HandleView input_event,
+-            const CONSOLE_PORTABLE_ATTACH_MSG& attach_msg,
+-            const core::HandleView signal_pipe,
++
++        [[nodiscard]] std::expected<std::optional<core::UniqueHandle>, SessionError> invoke_console_handoff(
++            const CLSID& handoff_clsid,
++            const bool require_default_terminal_marker,
++            const core::HandleView server_handle,
++            const core::HandleView input_event,
++            const CONSOLE_PORTABLE_ATTACH_MSG& attach_msg,
++            const core::HandleView signal_pipe,
+             const core::HandleView inbox_process,
+@@ -945,13 +996,29 @@
+             if (FAILED(create_hr))
+-            {
+-                return std::unexpected(SessionError{
+-                    .context = L"CoCreateInstance failed for IConsoleHandoff",
+-                    .win32_error = to_win32_error_from_hresult(create_hr),
+-                });
+-            }
+-
+-            HANDLE delegated_process = nullptr;
+-            const HRESULT handoff_hr = handoff.get()->EstablishHandoff(
+-                server_handle.get(),
+-                input_event.get(),
++            {
++                return std::unexpected(SessionError{
++                    .context = L"CoCreateInstance failed for IConsoleHandoff",
++                    .win32_error = to_win32_error_from_hresult(create_hr),
++                });
++            }
++
++            if (require_default_terminal_marker)
++            {
++                UniqueComInterface<IDefaultTerminalMarker> marker{};
++                const HRESULT marker_hr = handoff.get()->QueryInterface(
++                    __uuidof(IDefaultTerminalMarker),
++                    reinterpret_cast<void**>(marker.put()));
++                if (FAILED(marker_hr))
++                {
++                    logger.log(
++                        logging::LogLevel::debug,
++                        L"Default-terminal marker interface was unavailable for the Windows-decided target; skipping handoff (hr=0x{:08X})",
++                        static_cast<unsigned int>(marker_hr));
++                    return std::optional<core::UniqueHandle>{};
++                }
++            }
++
++            HANDLE delegated_process = nullptr;
++            const HRESULT handoff_hr = handoff.get()->EstablishHandoff(
++                server_handle.get(),
++                input_event.get(),
+                 &attach_msg,
+@@ -986,11 +1053,11 @@
+             else
+-            {
+-                logger.log(
+-                    logging::LogLevel::debug,
+-                    L"IConsoleHandoff::EstablishHandoff succeeded, delegated host PID unavailable (GetProcessId error={})",
+-                    ::GetLastError());
+-            }
+-
+-            return process;
+-        }
++            {
++                logger.log(
++                    logging::LogLevel::debug,
++                    L"IConsoleHandoff::EstablishHandoff succeeded, delegated host PID unavailable (GetProcessId error={})",
++                    ::GetLastError());
++            }
++
++            return std::optional<core::UniqueHandle>(std::move(process));
++        }
+ 

@@ -388,9 +388,9 @@ namespace oc::config
                 config.log_directory_path = trim(*value);
                 config.enable_file_logging = !config.log_directory_path.empty();
             }
-            else if (const auto value = read_environment(kLegacyLogFileEnv))
+            else if (const auto legacy_log_file = read_environment(kLegacyLogFileEnv))
             {
-                config.log_directory_path = directory_from_path(*value);
+                config.log_directory_path = directory_from_path(*legacy_log_file);
                 config.enable_file_logging = !config.log_directory_path.empty();
             }
             if (const auto value = read_environment(kEnableFileLoggingEnv))
