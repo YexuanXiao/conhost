@@ -24,6 +24,7 @@ namespace oc::renderer
         std::wstring title;
         int initial_width_px{ 800 };
         int initial_height_px{ 600 };
+        int show_command{ SW_SHOWDEFAULT };
 
         // Optional output source for windowed `--server` mode.
         std::shared_ptr<condrv::PublishedScreenBuffer> published_screen;

@@ -872,7 +872,19 @@ namespace oc::condrv
 
             if (auto server_info = comm->set_server_information(effective_input_event); !server_info)
             {
-                return std::unexpected(make_error(server_info.error().context, server_info.error().win32_error));
+                // `IOCTL_CONDRV_SET_SERVER_INFORMATION` is expected to be issued once per session.
+                // In handoff scenarios (default-terminal delegation or inbox-host fallback probing),
+                // the previous host may have already set it. The ConDrv driver returns
+                // `ERROR_BAD_COMMAND` for the redundant call; treat that as non-fatal so the server
+                // can proceed with the inherited state.
+                if (initial_packet != nullptr && server_info.error().win32_error == ERROR_BAD_COMMAND)
+                {
+                    logger.log(logging::LogLevel::debug, L"ConDrv server information was already set; continuing");
+                }
+                else
+                {
+                    return std::unexpected(make_error(server_info.error().context, server_info.error().win32_error));
+                }
             }
 
             logger.log(logging::LogLevel::info, L"ConDrv server loop starting");

@@ -144,7 +144,7 @@ namespace oc::renderer
             return false;
         }
 
-        ::ShowWindow(_hwnd, SW_SHOWDEFAULT);
+        ::ShowWindow(_hwnd, _config.show_command);
         ::UpdateWindow(_hwnd);
         return true;
     }

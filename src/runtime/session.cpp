@@ -11,12 +11,14 @@
 #include "renderer/window_host.hpp"
 #include "runtime/host_signal_input_thread.hpp"
 #include "runtime/key_input_encoder.hpp"
+#include "runtime/console_connection_policy.hpp"
 #include "runtime/server_handle_validator.hpp"
 #include "runtime/signal_pipe_monitor.hpp"
 
 #include "IConsoleHandoff.h"
 
 #include <Windows.h>
+#include <conmsgl1.h>
 #include <objbase.h>
 #include <winternl.h>
 
@@ -583,6 +585,77 @@ namespace oc::runtime
             return pair;
         }
 
+        // Determines whether the current process is running in an interactive user
+        // session suitable for UI hosting (visible window station, non-session-0).
+        //
+        // Upstream reference: `src/server/IoDispatchers.cpp::_isInteractiveUserSession`.
+        [[nodiscard]] bool is_interactive_user_session() noexcept
+        {
+            DWORD session_id{};
+            if (::ProcessIdToSessionId(::GetCurrentProcessId(), &session_id) != FALSE && session_id == 0)
+            {
+                return false;
+            }
+
+            const HWINSTA winsta = ::GetProcessWindowStation();
+            if (winsta != nullptr)
+            {
+                USEROBJECTFLAGS flags{};
+                if (::GetUserObjectInformationW(winsta, UOI_FLAGS, &flags, sizeof(flags), nullptr) != FALSE)
+                {
+                    return (flags.dwFlags & WSF_VISIBLE) != 0;
+                }
+            }
+
+            // If we cannot determine visibility, assume interactive to preserve
+            // compatibility with the inbox host.
+            return true;
+        }
+
+        [[nodiscard]] std::optional<ConsoleConnectionPolicyInput> try_read_connect_policy_input(
+            const condrv::ConDrvDeviceComm& comm,
+            const condrv::IoPacket& packet,
+            logging::Logger& logger) noexcept
+        {
+            if (packet.descriptor.function != condrv::console_io_connect)
+            {
+                return std::nullopt;
+            }
+
+            if (packet.descriptor.input_size < sizeof(CONSOLE_SERVER_MSG))
+            {
+                logger.log(
+                    logging::LogLevel::debug,
+                    L"CONNECT input buffer was too small for CONSOLE_SERVER_MSG; treating as unknown. bytes={}",
+                    static_cast<unsigned long>(packet.descriptor.input_size));
+                return std::nullopt;
+            }
+
+            CONSOLE_SERVER_MSG msg{};
+            condrv::IoOperation op{};
+            op.identifier = packet.descriptor.identifier;
+            op.buffer.offset = 0;
+            op.buffer.data = &msg;
+            op.buffer.size = sizeof(msg);
+
+            if (auto read = comm.read_input(op); !read)
+            {
+                logger.log(
+                    logging::LogLevel::warning,
+                    L"Failed to read CONNECT input buffer; treating as unknown connect policy. context='{}', error={}",
+                    read.error().context,
+                    read.error().win32_error);
+                return std::nullopt;
+            }
+
+            return ConsoleConnectionPolicyInput{
+                .console_app = msg.ConsoleApp != FALSE,
+                .window_visible = msg.WindowVisible != FALSE,
+                .startup_flags = msg.StartupFlags,
+                .show_window = msg.ShowWindow,
+            };
+        }
+
         [[nodiscard]] std::expected<std::optional<CLSID>, SessionError> resolve_console_handoff_clsid() noexcept
         {
             UniqueRegistryKey startup_key{};
@@ -861,7 +934,8 @@ namespace oc::runtime
             const SessionOptions& options,
             logging::Logger& logger,
             core::UniqueHandle input_available_event,
-            std::optional<condrv::IoPacket> initial_packet) noexcept
+            std::optional<condrv::IoPacket> initial_packet,
+            const int show_command) noexcept
         {
             auto stop_event = core::create_event(true, false, nullptr);
             if (!stop_event)
@@ -887,6 +961,7 @@ namespace oc::runtime
 
             renderer::WindowHostConfig window_config{};
             window_config.title = L"openconsole_new";
+            window_config.show_command = show_command;
             window_config.published_screen = published_screen;
             auto window = renderer::WindowHost::create(std::move(window_config), stop_event->view());
             if (!window)
@@ -989,9 +1064,10 @@ namespace oc::runtime
 
         [[nodiscard]] std::expected<DWORD, SessionError> run_windowed_server(
             const SessionOptions& options,
-            logging::Logger& logger) noexcept
+            logging::Logger& logger,
+            const int show_command) noexcept
         {
-            return run_windowed_server(options, logger, core::UniqueHandle{}, std::optional<condrv::IoPacket>{});
+            return run_windowed_server(options, logger, core::UniqueHandle{}, std::optional<condrv::IoPacket>{}, show_command);
         }
 
         class UniquePseudoConsole final
@@ -1989,78 +2065,172 @@ namespace oc::runtime
                 // See also: `new/docs/conhost_behavior_imitation_matrix.md`.
                 std::optional<condrv::IoPacket> initial_packet;
                 core::UniqueHandle input_available_event;
+                const bool interactive_session = is_interactive_user_session();
+                ConsoleConnectionPolicyDecision policy_decision{
+                    .create_window = interactive_session,
+                    .show_command = SW_SHOWDEFAULT,
+                    .attempt_default_terminal_handoff = interactive_session && !options.force_no_handoff,
+                };
 
-                if (!options.force_no_handoff)
+                // Read the initial CONNECT packet up-front so we can honor CREATE_NO_WINDOW / SW_HIDE
+                // before creating a classic window and before attempting defterm delegation.
+                auto device_comm = condrv::ConDrvDeviceComm::from_server_handle(options.server_handle);
+                if (!device_comm)
+                {
+                    logger.log(
+                        logging::LogLevel::warning,
+                        L"ConDrvDeviceComm::from_server_handle failed; falling back to default window policy. context='{}', error={}",
+                        device_comm.error().context,
+                        device_comm.error().win32_error);
+                }
+                 else
+                 {
+                     // The driver expects the server to provide an event that clients implicitly wait on
+                     // when input is unavailable. This is a manual-reset event because multiple clients
+                     // can be unblocked by a single input arrival.
+                     auto input_event = core::create_event(true, false, nullptr);
+                     if (!input_event)
+                     {
+                         logger.log(
+                             logging::LogLevel::warning,
+                             L"CreateEventW failed for input-available event; continuing without early server information. error={}",
+                             input_event.error());
+                     }
+                     else
+                     {
+                         input_available_event = std::move(input_event.value());
+                        const auto server_info = device_comm->set_server_information(input_available_event.view());
+                        if (!server_info)
+                        {
+                            logger.log(
+                                logging::LogLevel::warning,
+                                L"ConDrvDeviceComm::set_server_information failed; continuing. context='{}', error={}",
+                                server_info.error().context,
+                                server_info.error().win32_error);
+                        }
+                        else
+                        {
+                            condrv::IoPacket packet{};
+                            if (auto read = device_comm->read_io(nullptr, packet); !read)
+                            {
+                                logger.log(
+                                    logging::LogLevel::warning,
+                                    L"Initial ConDrv read_io failed; falling back to default window policy. context='{}', error={}",
+                                    read.error().context,
+                                    read.error().win32_error);
+                            }
+                            else
+                            {
+                                initial_packet.emplace(packet);
+                                if (auto connect = try_read_connect_policy_input(*device_comm, packet, logger))
+                                {
+                                    policy_decision = ConsoleConnectionPolicy::decide(
+                                        *connect,
+                                        options.force_no_handoff,
+                                        options.create_server_handle,
+                                        options.headless,
+                                        options.in_conpty_mode,
+                                        interactive_session);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!policy_decision.create_window)
+                {
+                    logger.log(logging::LogLevel::info, L"Starting server host without a window (no visible console window requested)");
+
+                    if (initial_packet.has_value())
+                    {
+                        auto server_result = condrv::ConDrvServer::run_with_handoff(
+                            options.server_handle,
+                            options.signal_handle,
+                            input_available_event.view(),
+                            core::HandleView{},
+                            core::HandleView{},
+                            core::HandleView{},
+                            initial_packet.value(),
+                            logger);
+                        if (!server_result)
+                        {
+                            return std::unexpected(SessionError{
+                                .context = server_result.error().context,
+                                .win32_error = server_result.error().win32_error,
+                            });
+                        }
+                        return server_result.value();
+                    }
+
+                    auto server_result = condrv::ConDrvServer::run(
+                        options.server_handle,
+                        options.signal_handle,
+                        core::HandleView{},
+                        core::HandleView{},
+                        core::HandleView{},
+                        logger);
+                    if (!server_result)
+                    {
+                        return std::unexpected(SessionError{
+                            .context = server_result.error().context,
+                            .win32_error = server_result.error().win32_error,
+                        });
+                    }
+                    return server_result.value();
+                }
+
+                if (policy_decision.attempt_default_terminal_handoff)
                 {
                     auto delegation_target = resolve_console_handoff_clsid();
                     if (!delegation_target)
                     {
-                        logger.log(
-                            logging::LogLevel::warning,
-                            L"Default-terminal delegation probe failed; falling back to classic window. context='{}', error={}",
-                            delegation_target.error().context,
-                            delegation_target.error().win32_error);
-                    }
+                         logger.log(
+                             logging::LogLevel::warning,
+                             L"Default-terminal delegation probe failed; falling back to classic window. context='{}', error={}",
+                             delegation_target.error().context,
+                             delegation_target.error().win32_error);
+                     }
                     else if (delegation_target->has_value())
                     {
-                        // The driver expects the server to provide an event that
-                        // clients implicitly wait on when input is unavailable.
-                        // This is a manual-reset event because multiple clients
-                        // can be unblocked by a single input arrival.
-                        auto input_event = core::create_event(true, false, nullptr);
-                        if (!input_event)
+                        if (!device_comm)
                         {
                             logger.log(
                                 logging::LogLevel::warning,
-                                L"Default-terminal delegation input event creation failed; falling back to classic window. error={}",
-                                input_event.error());
+                                L"Default-terminal delegation skipped because ConDrv device comm was unavailable; falling back to classic window");
+                        }
+                        else if (!initial_packet.has_value())
+                        {
+                            logger.log(
+                                logging::LogLevel::warning,
+                                L"Default-terminal delegation skipped because no initial ConDrv packet was available; falling back to classic window");
                         }
                         else
                         {
-                            input_available_event = std::move(input_event.value());
-                            auto comm = condrv::ConDrvDeviceComm::from_server_handle(options.server_handle);
-                            if (!comm)
+                            if (!input_available_event.valid())
                             {
-                                logger.log(
-                                    logging::LogLevel::warning,
-                                    L"Default-terminal delegation could not duplicate server handle; falling back to classic window. context='{}', error={}",
-                                    comm.error().context,
-                                    comm.error().win32_error);
-                            }
-                            else
-                            {
-                                // Register the input event with the driver so
-                                // clients can observe input availability.
-                                if (auto server_info = comm->set_server_information(input_available_event.view()); !server_info)
+                                auto input_event = core::create_event(true, false, nullptr);
+                                if (!input_event)
                                 {
                                     logger.log(
                                         logging::LogLevel::warning,
-                                        L"Default-terminal delegation could not set server information; falling back to classic window. context='{}', error={}",
-                                        server_info.error().context,
-                                        server_info.error().win32_error);
+                                        L"Default-terminal delegation input event creation failed; falling back to classic window. error={}",
+                                        input_event.error());
                                 }
                                 else
                                 {
-                                    // Read the first driver IO packet now:
-                                    // - Delegation needs a "portable attach"
-                                    //   message (identifier + process/object).
-                                    // - If delegation fails, we must still
-                                    //   process this packet in our own server
-                                    //   loop. We stash it in `initial_packet`
-                                    //   so the windowed server thread can start
-                                    //   with the already-consumed message.
-                                    condrv::IoPacket packet{};
-                                    if (auto read = comm->read_io(nullptr, packet); !read)
-                                    {
-                                        logger.log(
-                                            logging::LogLevel::warning,
-                                            L"Default-terminal delegation initial IO read failed; falling back to classic window. context='{}', error={}",
-                                            read.error().context,
-                                            read.error().win32_error);
-                                    }
-                                    else
-                                    {
-                                        initial_packet.emplace(packet);
+                                    input_available_event = std::move(input_event.value());
+                                }
+                            }
+
+                             if (!input_available_event.valid())
+                             {
+                                 logger.log(
+                                     logging::LogLevel::warning,
+                                     L"Default-terminal delegation skipped because input event creation failed; falling back to classic window");
+                             }
+                            else
+                            {
+                                const auto packet = initial_packet.value();
 
                                         // Minimal attach payload (stable fields only) used by
                                         // `IConsoleHandoff::EstablishHandoff`.
@@ -2485,16 +2655,19 @@ namespace oc::runtime
                                 }
                             }
                         }
-                    }
-                }
 
                 logger.log(logging::LogLevel::info, L"Starting windowed server host");
                 if (initial_packet.has_value())
                 {
-                    return run_windowed_server(options, logger, std::move(input_available_event), std::move(initial_packet));
+                    return run_windowed_server(
+                        options,
+                        logger,
+                        std::move(input_available_event),
+                        std::move(initial_packet),
+                        policy_decision.show_command);
                 }
 
-                return run_windowed_server(options, logger);
+                return run_windowed_server(options, logger, policy_decision.show_command);
             }
 
             core::HandleView stop_signal = options.signal_handle;

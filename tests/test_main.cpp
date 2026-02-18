@@ -2,6 +2,7 @@
 #include <Windows.h>
 
 bool run_console_arguments_tests();
+bool run_console_connection_policy_tests();
 bool run_config_tests();
 bool run_logger_tests();
 bool run_key_input_encoder_tests();
@@ -40,6 +41,13 @@ int main()
     if (!run_console_arguments_tests())
     {
         fwprintf(stderr, L"[FAIL] console arguments tests\n");
+        ++failed;
+    }
+
+    trace(L"console connection policy");
+    if (!run_console_connection_policy_tests())
+    {
+        fwprintf(stderr, L"[FAIL] console connection policy tests\n");
         ++failed;
     }
 
