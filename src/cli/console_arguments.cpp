@@ -155,6 +155,22 @@ namespace oc::cli
                 continue;
             }
 
+            // COM local-server activation may pass `/Embedding` instead of `-Embedding`.
+            // Accept both spellings so COM registration can omit explicit arguments.
+            if (arg == L"/Embedding")
+            {
+                _run_as_com_server = true;
+                consume_arg(args, index);
+                continue;
+            }
+
+            if (arg == delegated_window_arg)
+            {
+                _delegated_window = true;
+                consume_arg(args, index);
+                continue;
+            }
+
             if (starts_with(arg, filepath_leader_prefix))
             {
                 consume_arg(args, index);
@@ -446,6 +462,11 @@ namespace oc::cli
     bool ConsoleArguments::should_run_as_com_server() const noexcept
     {
         return _run_as_com_server;
+    }
+
+    bool ConsoleArguments::delegated_window_requested() const noexcept
+    {
+        return _delegated_window;
     }
 
     core::HandleView ConsoleArguments::server_handle() const noexcept

@@ -1,5 +1,6 @@
 add_executable(oc_new_tests
     test_main.cpp
+    console_attributes_tests.cpp
     console_arguments_tests.cpp
     console_connection_policy_tests.cpp
     config_tests.cpp

@@ -26,6 +26,8 @@
   - Session runtime, pseudo console process hosting, handle validation, keyboard-to-VT encoding, and startup launch-policy compatibility (`ForceV2`/`ForceV1` legacy decision path).
 - `src/renderer`
   - Non-WinUI rendering building blocks for the classic conhost window (font/cell metrics, minimal Win32 window host skeleton, future layout/paint backends).
+- `src/view`
+  - Neutral view-model data types shared between `condrv` and `renderer` (immutable viewport snapshots and lock-free publication containers).
 - `src/app`
   - High-level orchestration and executable entrypoint.
 - `tests`

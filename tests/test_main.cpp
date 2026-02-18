@@ -2,6 +2,7 @@
 #include <Windows.h>
 
 bool run_console_arguments_tests();
+bool run_console_attributes_tests();
 bool run_console_connection_policy_tests();
 bool run_config_tests();
 bool run_logger_tests();
@@ -41,6 +42,13 @@ int main()
     if (!run_console_arguments_tests())
     {
         fwprintf(stderr, L"[FAIL] console arguments tests\n");
+        ++failed;
+    }
+
+    trace(L"console attributes");
+    if (!run_console_attributes_tests())
+    {
+        fwprintf(stderr, L"[FAIL] console attributes tests\n");
         ++failed;
     }
 

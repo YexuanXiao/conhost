@@ -836,7 +836,7 @@ namespace oc::runtime
             core::HandleView stop_event{};
             logging::Logger* logger{};
             HWND window{};
-            std::shared_ptr<condrv::PublishedScreenBuffer> published_screen;
+            std::shared_ptr<view::PublishedScreenBuffer> published_screen;
             core::UniqueHandle input_available_event;
             std::optional<condrv::IoPacket> initial_packet;
 
@@ -946,10 +946,10 @@ namespace oc::runtime
                 });
             }
 
-            std::shared_ptr<condrv::PublishedScreenBuffer> published_screen;
+            std::shared_ptr<view::PublishedScreenBuffer> published_screen;
             try
             {
-                published_screen = std::make_shared<condrv::PublishedScreenBuffer>();
+                published_screen = std::make_shared<view::PublishedScreenBuffer>();
             }
             catch (...)
             {

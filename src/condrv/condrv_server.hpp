@@ -43,6 +43,7 @@
 #include "condrv/condrv_device_comm.hpp"
 #include "condrv/command_history.hpp"
 #include "condrv/screen_buffer_snapshot.hpp"
+#include "view/screen_buffer_snapshot.hpp"
 #include "condrv/vt_input_decoder.hpp"
 #include "core/assert.hpp"
 #include "core/host_signals.hpp"
@@ -9374,7 +9375,7 @@ namespace oc::logging
             core::HandleView host_output,
             core::HandleView host_signal_pipe,
             logging::Logger& logger,
-            std::shared_ptr<PublishedScreenBuffer> published,
+            std::shared_ptr<view::PublishedScreenBuffer> published,
             HWND paint_target) noexcept;
 
         // Handoff entry point used by `-Embedding` scenarios: a pending IO
@@ -9404,7 +9405,7 @@ namespace oc::logging
             core::HandleView host_signal_pipe,
             const IoPacket& initial_packet,
             logging::Logger& logger,
-            std::shared_ptr<PublishedScreenBuffer> published,
+            std::shared_ptr<view::PublishedScreenBuffer> published,
             HWND paint_target) noexcept;
     };
 }

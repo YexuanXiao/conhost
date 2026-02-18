@@ -255,6 +255,22 @@ namespace
         return parsed->force_no_handoff();
     }
 
+    bool test_delegated_window_flag_parses_before_embedding()
+    {
+        auto parsed = oc::cli::ConsoleArguments::parse(
+            L"openconsole.exe --delegated-window /Embedding",
+            oc::core::HandleView{},
+            oc::core::HandleView{});
+        if (!parsed)
+        {
+            return false;
+        }
+
+        return parsed->should_run_as_com_server() &&
+               parsed->delegated_window_requested() &&
+               parsed->client_command_line().empty();
+    }
+
     bool test_invalid_feature_fails()
     {
         auto parsed = oc::cli::ConsoleArguments::parse(
@@ -359,6 +375,11 @@ bool run_console_arguments_tests()
     if (!test_force_no_handoff_flag())
     {
         fwprintf(stderr, L"[DETAIL] test_force_no_handoff_flag failed\n");
+        return false;
+    }
+    if (!test_delegated_window_flag_parses_before_embedding())
+    {
+        fwprintf(stderr, L"[DETAIL] test_delegated_window_flag_parses_before_embedding failed\n");
         return false;
     }
     if (!test_missing_server_handle_value_fails())

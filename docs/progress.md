@@ -1,5 +1,25 @@
 # Progress Log
 
+## 2026-02-18
+- Decoupled GUI and non-GUI layers for classic window rendering:
+  - moved the immutable viewport snapshot types to a neutral `view/` module (`view::ScreenBufferSnapshot`, `view::PublishedScreenBuffer`).
+  - kept the snapshot builder in ConDrv (`condrv::make_viewport_snapshot`) to convert the mutable `condrv::ScreenBuffer` model into the immutable view snapshot.
+- Improved classic window renderer output parity:
+  - `renderer::WindowHost` now renders legacy 16-color attributes (foreground/background) and a basic cursor using Direct2D/DirectWrite.
+  - added `COMMON_LVB_REVERSE_VIDEO` and `COMMON_LVB_UNDERSCORE` handling in the paint path.
+- Added non-GUI coverage for renderer helpers:
+  - introduced `renderer/console_attributes.hpp` and unit tests for attribute decoding.
+- Updated design documentation:
+  - refreshed renderer snapshot/window-host docs to reference the new `view/` snapshot boundary.
+  - added a dedicated design doc for attribute + cursor rendering.
+- Added developer-facing instructions and tooling for default-terminal registration:
+  - documented per-user `DelegationConsole` + COM `LocalServer32` wiring in `docs/howto/default_terminal.md`.
+  - added `tools/register_default_terminal.ps1` helper to apply and roll back the registry changes.
+- Added explicit delegated-window mode for default-terminal COM activation:
+  - added `--delegated-window` to opt into classic window hosting when launched via `IConsoleHandoff` (`-Embedding` remains headless by default).
+  - accepted `/Embedding` in addition to `-Embedding` for COM activation robustness.
+  - updated the registration helper to register `LocalServer32` as `"openconsole_new.exe" --delegated-window` (COM appends `/Embedding`).
+
 ## 2026-02-17
 - Fixed default-terminal delegation for classic windowed `--server` startup:
   - when started as `--server` in non-headless, non-ConPTY mode, `runtime::Session` now probes `HKCU\\Console\\%%Startup\\DelegationConsole` and calls `IConsoleHandoff::EstablishHandoff`.

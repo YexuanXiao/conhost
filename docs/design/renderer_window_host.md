@@ -31,7 +31,7 @@ The replacement copies only the minimal structural pattern: register a class, cr
    - message pump (`GetMessageW` / `DispatchMessageW`)
    - `WM_SIZE` and `WM_PAINT` handlers
 2. Use Direct2D + DirectWrite for painting (no GDI text).
-3. Render the active `condrv::ScreenBuffer` viewport contents (monochrome) via a published snapshot.
+3. Render the active `condrv::ScreenBuffer` viewport contents (legacy 16-color attributes + cursor) via a published snapshot.
 4. Integrate the window host into the server-handle startup path:
    - if `--server` is used and we are not in ConPTY/headless mode, run the ConDrv server on a worker thread and the UI
      message pump on the main thread.
@@ -40,10 +40,9 @@ The replacement copies only the minimal structural pattern: register a class, cr
 
 ## Non-Goals (This Increment)
 
-- Rendering attributes/colors, cursor, selection, IME, accessibility, or scroll bars.
 - Keyboard/mouse input injection into the ConDrv input model.
 - High DPI handling (`WM_DPICHANGED`) beyond "it paints".
-- Scroll bars, selection, clipboard, accessibility, IME/TSF, theming.
+- Scroll bars, selection, clipboard, IME/TSF, accessibility, theming.
 
 ## Design
 
@@ -70,15 +69,17 @@ Lifecycle:
 
 - `WM_DESTROY` signals the supplied `stop_event` (if any) and posts `WM_QUIT`.
 - Paint uses `BeginPaint/EndPaint` for correct invalidation behavior and renders either:
-  - the latest published `ScreenBuffer` snapshot (viewport text, monochrome), or
+  - the latest published `ScreenBuffer` snapshot (viewport text + attributes + cursor), or
   - a placeholder message if no snapshot is available yet.
 - Device-loss (`D2DERR_RECREATE_TARGET`) drops the render target and brush so the next paint recreates them.
 
 Snapshot integration:
 
-- The ConDrv server publishes viewport snapshots to a `condrv::PublishedScreenBuffer`.
+- The ConDrv server publishes viewport snapshots to a `view::PublishedScreenBuffer`.
 - After publishing, the server thread posts `WM_APP + 1` to the window HWND.
 - `WindowHost` handles `WM_APP + 1` by invalidating the window (`InvalidateRect`) to request a repaint.
+
+The snapshot container type lives in `view/` so the renderer does not need to include ConDrv implementation headers.
 
 ### 2) Windowed Server Startup (`runtime::Session`)
 
@@ -99,10 +100,10 @@ This keeps the server loop and UI responsive without introducing `<thread>`.
 
 This skeleton currently:
 
-- does not inject window keyboard input into the ConDrv input queue
-- does not render the `ScreenBuffer` model
+- does not inject window keyboard/mouse input into the ConDrv input queue
+- renders viewport text with legacy 16-color attributes and a basic cursor (no selection, scroll bars, IME, or accessibility)
 
-The ConDrv server still updates its in-memory model; connecting that model to renderer invalidation is a follow-up.
+The ConDrv server publishes snapshots of its in-memory model and triggers invalidation via `WM_APP + 1`.
 
 ## Tests
 
@@ -111,7 +112,7 @@ non-GUI. Non-GUI rendering components (like text measurement) remain unit-tested
 
 ## Limitations / Follow-Ups
 
-1. Render attributes/colors and cursor; implement selection/clipboard/scroll bars.
+1. Implement selection/clipboard/scroll bars.
 2. Inject window keyboard input as ConDrv input events.
 3. Implement high DPI handling and proper resizing rules.
-4. Implement selection/scroll bars/clipboard and accessibility hooks.
+4. Add IME/TSF and accessibility hooks.

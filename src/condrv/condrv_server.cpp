@@ -817,7 +817,7 @@ namespace oc::condrv
             const core::HandleView host_output,
             const core::HandleView host_signal_pipe,
             const IoPacket* const initial_packet,
-            std::shared_ptr<PublishedScreenBuffer> published_screen,
+            std::shared_ptr<view::PublishedScreenBuffer> published_screen,
             const HWND paint_target,
             logging::Logger& logger) noexcept
         {
@@ -3241,7 +3241,7 @@ namespace oc::condrv
         const core::HandleView host_output,
         const core::HandleView host_signal_pipe,
         logging::Logger& logger,
-        std::shared_ptr<PublishedScreenBuffer> published,
+        std::shared_ptr<view::PublishedScreenBuffer> published,
         const HWND paint_target) noexcept
     try
     {
@@ -3299,7 +3299,7 @@ namespace oc::condrv
         const core::HandleView host_signal_pipe,
         const IoPacket& initial_packet,
         logging::Logger& logger,
-        std::shared_ptr<PublishedScreenBuffer> published,
+        std::shared_ptr<view::PublishedScreenBuffer> published,
         const HWND paint_target) noexcept
     try
     {

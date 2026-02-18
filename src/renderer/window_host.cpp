@@ -1,5 +1,6 @@
 #include "renderer/window_host.hpp"
 
+#include "renderer/console_attributes.hpp"
 #include "renderer/dwrite_text_measurer.hpp"
 
 #include <d2d1.h>
@@ -32,6 +33,7 @@ namespace oc::renderer
         winrt::com_ptr<ID2D1Factory> d2d_factory;
         winrt::com_ptr<ID2D1HwndRenderTarget> render_target;
         winrt::com_ptr<ID2D1SolidColorBrush> text_brush;
+        winrt::com_ptr<ID2D1SolidColorBrush> background_brush;
 
         winrt::com_ptr<IDWriteFactory> dwrite_factory;
         winrt::com_ptr<IDWriteTextFormat> text_format;
@@ -262,7 +264,7 @@ namespace oc::renderer
         const auto snapshot = _config.published_screen ? _config.published_screen->latest() : nullptr;
 
         ensure_device_resources();
-        if (_resources && _resources->render_target && _resources->text_brush && _resources->dwrite_factory)
+        if (_resources && _resources->render_target && _resources->text_brush && _resources->background_brush && _resources->dwrite_factory)
         {
             RECT client{};
             ::GetClientRect(_hwnd, &client);
@@ -380,7 +382,20 @@ namespace oc::renderer
             }
 
             _resources->render_target->BeginDraw();
-            _resources->render_target->Clear(D2D1::ColorF(D2D1::ColorF::Black));
+
+            const auto to_d2d = [](const COLORREF color) noexcept {
+                constexpr float inv = 1.0f / 255.0f;
+                return D2D1::ColorF(
+                    static_cast<float>(GetRValue(color)) * inv,
+                    static_cast<float>(GetGValue(color)) * inv,
+                    static_cast<float>(GetBValue(color)) * inv);
+            };
+
+            const COLORREF clear_bg_ref = snapshot
+                ? snapshot->color_table[decode_attributes(snapshot->default_attributes).background_index]
+                : RGB(0, 0, 0);
+
+            _resources->render_target->Clear(to_d2d(clear_bg_ref));
 
             bool drew_snapshot = false;
             if (snapshot && _resources->text_format && _resources->has_metrics)
@@ -388,6 +403,7 @@ namespace oc::renderer
                 const int viewport_w = snapshot->viewport_size.X > 0 ? snapshot->viewport_size.X : 0;
                 const int viewport_h = snapshot->viewport_size.Y > 0 ? snapshot->viewport_size.Y : 0;
 
+                const int cell_w = std::max(1, _resources->cell_metrics.width_px);
                 const int cell_h = std::max(1, _resources->cell_metrics.height_px);
 
                 const float margin_x = 0.0f;
@@ -403,20 +419,146 @@ namespace oc::renderer
                     }
 
                     const wchar_t* row_ptr = snapshot->text.data() + offset;
+                    const USHORT* attr_ptr = nullptr;
+                    if (offset + static_cast<size_t>(viewport_w) <= snapshot->attributes.size())
+                    {
+                        attr_ptr = snapshot->attributes.data() + offset;
+                    }
                     const float top = margin_y + static_cast<float>(row) * row_height;
-                    const D2D1_RECT_F layout{
-                        margin_x,
-                        top,
-                        std::max(margin_x, width),
-                        std::max(top + row_height, top),
-                    };
 
-                    _resources->render_target->DrawTextW(
-                        row_ptr,
-                        static_cast<UINT32>(viewport_w),
-                        _resources->text_format.get(),
-                        layout,
-                        _resources->text_brush.get());
+                    int col = 0;
+                    while (col < viewport_w)
+                    {
+                        const USHORT attributes = attr_ptr ? attr_ptr[col] : snapshot->default_attributes;
+                        int run_start = col;
+                        for (; col < viewport_w; ++col)
+                        {
+                            const USHORT current = attr_ptr ? attr_ptr[col] : snapshot->default_attributes;
+                            if (current != attributes)
+                            {
+                                break;
+                            }
+                        }
+
+                        const int run_len = col - run_start;
+                        if (run_len <= 0)
+                        {
+                            continue;
+                        }
+
+                        const auto decoded = decode_attributes(attributes);
+                        const COLORREF fg_ref = snapshot->color_table[decoded.foreground_index];
+                        const COLORREF bg_ref = snapshot->color_table[decoded.background_index];
+
+                        const float left = margin_x + static_cast<float>(run_start * cell_w);
+                        const float right = left + static_cast<float>(run_len * cell_w);
+                        const float bottom = top + row_height;
+
+                        if (bg_ref != clear_bg_ref)
+                        {
+                            _resources->background_brush->SetColor(to_d2d(bg_ref));
+                            _resources->render_target->FillRectangle(
+                                D2D1::RectF(left, top, right, bottom),
+                                _resources->background_brush.get());
+                        }
+
+                        bool has_text = false;
+                        for (int i = 0; i < run_len; ++i)
+                        {
+                            if (row_ptr[run_start + i] != L' ')
+                            {
+                                has_text = true;
+                                break;
+                            }
+                        }
+
+                        if (has_text)
+                        {
+                            _resources->text_brush->SetColor(to_d2d(fg_ref));
+                            const D2D1_RECT_F layout{
+                                left,
+                                top,
+                                std::max(left, width),
+                                std::max(bottom, top),
+                            };
+
+                            _resources->render_target->DrawTextW(
+                                row_ptr + run_start,
+                                static_cast<UINT32>(run_len),
+                                _resources->text_format.get(),
+                                layout,
+                                _resources->text_brush.get());
+                        }
+
+                        if (decoded.underline)
+                        {
+                            const int underline_thickness = std::max(1, _resources->cell_metrics.underline_thickness_px);
+                            const float underline_top = top + static_cast<float>(_resources->cell_metrics.underline_position_px);
+                            const float underline_bottom = std::min(bottom, underline_top + static_cast<float>(underline_thickness));
+                            if (underline_bottom > underline_top)
+                            {
+                                _resources->background_brush->SetColor(to_d2d(fg_ref));
+                                _resources->render_target->FillRectangle(
+                                    D2D1::RectF(left, underline_top, right, underline_bottom),
+                                    _resources->background_brush.get());
+                            }
+                        }
+                    }
+                }
+
+                if (snapshot->cursor_visible && viewport_w > 0 && viewport_h > 0 && !snapshot->text.empty())
+                {
+                    const int cursor_x = static_cast<int>(snapshot->cursor_position.X) - static_cast<int>(snapshot->window_rect.Left);
+                    const int cursor_y = static_cast<int>(snapshot->cursor_position.Y) - static_cast<int>(snapshot->window_rect.Top);
+                    if (cursor_x >= 0 && cursor_x < viewport_w && cursor_y >= 0 && cursor_y < viewport_h)
+                    {
+                        const size_t index = static_cast<size_t>(cursor_y) * static_cast<size_t>(viewport_w) + static_cast<size_t>(cursor_x);
+                        const USHORT cursor_attr = index < snapshot->attributes.size() ? snapshot->attributes[index] : snapshot->default_attributes;
+                        const auto decoded = decode_attributes(cursor_attr);
+                        const COLORREF fg_ref = snapshot->color_table[decoded.foreground_index];
+
+                        unsigned cursor_size = snapshot->cursor_size;
+                        cursor_size = std::clamp(cursor_size, 1u, 100u);
+
+                        const float cell_left = margin_x + static_cast<float>(cursor_x * cell_w);
+                        const float cell_top = margin_y + static_cast<float>(cursor_y * cell_h);
+                        const float cell_right = cell_left + static_cast<float>(cell_w);
+                        const float cell_bottom = cell_top + static_cast<float>(cell_h);
+
+                        const float cursor_height = static_cast<float>(cell_h) * (static_cast<float>(cursor_size) / 100.0f);
+                        const float cursor_top = std::max(cell_top, cell_bottom - cursor_height);
+
+                        _resources->background_brush->SetColor(to_d2d(fg_ref));
+                        _resources->render_target->FillRectangle(
+                            D2D1::RectF(cell_left, cursor_top, cell_right, cell_bottom),
+                            _resources->background_brush.get());
+
+                        // If the cursor is a full block, redraw the glyph with inverted colors for visibility.
+                        if (cursor_height >= static_cast<float>(cell_h - 1))
+                        {
+                            const COLORREF bg_ref = snapshot->color_table[decoded.background_index];
+                            wchar_t ch = index < snapshot->text.size() ? snapshot->text[index] : L' ';
+                            if (ch == L'\0')
+                            {
+                                ch = L' ';
+                            }
+
+                            _resources->text_brush->SetColor(to_d2d(bg_ref));
+                            const D2D1_RECT_F layout{
+                                cell_left,
+                                cell_top,
+                                std::max(cell_left, width),
+                                std::max(cell_bottom, cell_top),
+                            };
+
+                            _resources->render_target->DrawTextW(
+                                &ch,
+                                1,
+                                _resources->text_format.get(),
+                                layout,
+                                _resources->text_brush.get());
+                        }
+                    }
                 }
 
                 drew_snapshot = true;
@@ -537,6 +679,19 @@ namespace oc::renderer
             }
             _resources->text_brush = std::move(brush);
         }
+
+        if (!_resources->background_brush)
+        {
+            winrt::com_ptr<ID2D1SolidColorBrush> brush;
+            const HRESULT hr = _resources->render_target->CreateSolidColorBrush(
+                D2D1::ColorF(D2D1::ColorF::Black),
+                brush.put());
+            if (FAILED(hr))
+            {
+                return;
+            }
+            _resources->background_brush = std::move(brush);
+        }
     }
 
     void WindowHost::discard_device_resources() noexcept
@@ -544,6 +699,7 @@ namespace oc::renderer
         if (_resources)
         {
             _resources->text_brush = nullptr;
+            _resources->background_brush = nullptr;
             _resources->render_target = nullptr;
         }
     }

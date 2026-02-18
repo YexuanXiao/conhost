@@ -9,7 +9,7 @@
 
 #include "core/exception.hpp"
 #include "core/handle_view.hpp"
-#include "condrv/screen_buffer_snapshot.hpp"
+#include "view/screen_buffer_snapshot.hpp"
 
 #include <Windows.h>
 
@@ -27,7 +27,7 @@ namespace oc::renderer
         int show_command{ SW_SHOWDEFAULT };
 
         // Optional output source for windowed `--server` mode.
-        std::shared_ptr<condrv::PublishedScreenBuffer> published_screen;
+        std::shared_ptr<view::PublishedScreenBuffer> published_screen;
 
         // Rendering defaults (monochrome snapshot rendering uses these knobs).
         std::wstring font_family{ L"Consolas" };

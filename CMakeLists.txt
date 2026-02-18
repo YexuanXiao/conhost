@@ -22,6 +22,7 @@ add_library(oc_new_core STATIC
     src/renderer/window_host.cpp
     src/runtime/key_input_encoder.cpp
     src/runtime/com_embedding_server.cpp
+    src/runtime/default_terminal_host.cpp
     src/runtime/launch_policy.cpp
     src/runtime/legacy_conhost.cpp
     src/runtime/host_signal_input_thread.cpp

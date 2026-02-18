@@ -22,9 +22,13 @@ resource cleanup brittle. Instead, the renderer should consume an immutable snap
 
 ## Design
 
+The snapshot data types live in `view/` so the renderer does not need to include or depend on the ConDrv server
+implementation. The ConDrv layer provides the snapshot *builder* (`condrv::make_viewport_snapshot`) that converts the
+mutable `condrv::ScreenBuffer` model into an immutable `view::ScreenBufferSnapshot`.
+
 ### 1) Snapshot Type
 
-`condrv::ScreenBufferSnapshot` contains:
+`view::ScreenBufferSnapshot` contains:
 
 - revision number (monotonic best-effort)
 - buffer + viewport geometry (`buffer_size`, `window_rect`, derived `viewport_size`)
@@ -39,7 +43,7 @@ Only the viewport is snapshotted because:
 
 ### 2) Publication Container
 
-`condrv::PublishedScreenBuffer` stores:
+`view::PublishedScreenBuffer` stores:
 
 - `std::atomic<std::shared_ptr<const ScreenBufferSnapshot>> _latest`
 
@@ -74,7 +78,5 @@ This keeps the cross-thread contract narrow and avoids UI-thread reentrancy haza
 
 ## Limitations / Follow-Ups
 
-1. Render attributes/colors (foreground/background) and cursor.
-2. Add a stable "dirty region" model to avoid full snapshots/redraws on every write.
-3. Integrate keyboard/mouse input injection into the ConDrv input model.
-
+1. Add a stable "dirty region" model to avoid full snapshots/redraws on every write.
+2. Integrate keyboard/mouse input injection into the ConDrv input model.

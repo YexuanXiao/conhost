@@ -7,6 +7,7 @@
 #include "localization/localizer.hpp"
 #include "logging/logger.hpp"
 #include "runtime/com_embedding_server.hpp"
+#include "runtime/default_terminal_host.hpp"
 #include "runtime/launch_policy.hpp"
 #include "runtime/legacy_conhost.hpp"
 #include "runtime/session.hpp"
@@ -148,7 +149,18 @@ namespace oc::app
         if (args.should_run_as_com_server())
         {
             logger.log(logging::LogLevel::info, L"Embedding mode requested; starting COM local server");
-            auto com_server_result = runtime::ComEmbeddingServer::run(logger, config.embedding_wait_timeout_ms);
+            const bool windowed_default_terminal = args.delegated_window_requested();
+            if (windowed_default_terminal)
+            {
+                logger.log(logging::LogLevel::info, L"Delegated window mode requested; hosting classic window for default-terminal handoff");
+            }
+
+            auto com_server_result = windowed_default_terminal
+                ? runtime::ComEmbeddingServer::run_with_runner(
+                      logger,
+                      config.embedding_wait_timeout_ms,
+                      &runtime::run_windowed_default_terminal_host)
+                : runtime::ComEmbeddingServer::run(logger, config.embedding_wait_timeout_ms);
             if (!com_server_result)
             {
                 logger.log(

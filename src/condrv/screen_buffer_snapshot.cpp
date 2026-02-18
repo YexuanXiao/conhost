@@ -44,11 +44,11 @@ namespace oc::condrv
         }
     }
 
-    std::expected<std::shared_ptr<const ScreenBufferSnapshot>, DeviceCommError> make_viewport_snapshot(
+    std::expected<std::shared_ptr<const view::ScreenBufferSnapshot>, DeviceCommError> make_viewport_snapshot(
         const ScreenBuffer& buffer) noexcept
     try
     {
-        auto snapshot = std::make_shared<ScreenBufferSnapshot>();
+        auto snapshot = std::make_shared<view::ScreenBufferSnapshot>();
         snapshot->revision = buffer.revision();
         snapshot->window_rect = buffer.window_rect();
         snapshot->buffer_size = buffer.screen_buffer_size();
@@ -102,7 +102,7 @@ namespace oc::condrv
             }
         }
 
-        return std::shared_ptr<const ScreenBufferSnapshot>(std::move(snapshot));
+        return std::shared_ptr<const view::ScreenBufferSnapshot>(std::move(snapshot));
     }
     catch (...)
     {

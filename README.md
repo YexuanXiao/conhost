@@ -22,6 +22,9 @@ cmake --build build-new
 ctest --test-dir build-new --output-on-failure
 ```
 
+Default terminal (dev):
+- To register `openconsole_new` as the per-user Windows “default terminal” (classic `IConsoleHandoff` delegation), see `docs/howto/default_terminal.md`.
+
 Key runtime configuration environment variables:
 - `OPENCONSOLE_NEW_CONFIG`: optional config file path.
 - `OPENCONSOLE_NEW_LOG_LEVEL`: `trace|debug|info|warning|error`.

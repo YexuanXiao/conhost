@@ -50,6 +50,7 @@ namespace oc::cli
         static constexpr std::wstring_view feature_arg = L"--feature";
         static constexpr std::wstring_view feature_pty_arg = L"pty";
         static constexpr std::wstring_view com_server_arg = L"-Embedding";
+        static constexpr std::wstring_view delegated_window_arg = L"--delegated-window";
         static constexpr std::wstring_view text_measurement_arg = L"--textMeasurement";
 
         [[nodiscard]] static std::expected<ConsoleArguments, ParseError> parse(std::wstring_view command_line, core::HandleView std_in, core::HandleView std_out) noexcept;
@@ -59,6 +60,7 @@ namespace oc::cli
         [[nodiscard]] bool is_headless() const noexcept;
         [[nodiscard]] bool should_create_server_handle() const noexcept;
         [[nodiscard]] bool should_run_as_com_server() const noexcept;
+        [[nodiscard]] bool delegated_window_requested() const noexcept;
 
         [[nodiscard]] core::HandleView server_handle() const noexcept;
         [[nodiscard]] core::HandleView vt_in_handle() const noexcept;
@@ -107,6 +109,7 @@ namespace oc::cli
         short _height{ 0 };
 
         bool _run_as_com_server{ false };
+        bool _delegated_window{ false };
         bool _create_server_handle{ true };
         uintptr_t _server_handle{ 0 };
         uintptr_t _signal_handle{ 0 };
