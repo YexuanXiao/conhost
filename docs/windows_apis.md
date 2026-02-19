@@ -23,8 +23,16 @@ This document lists Windows APIs used by the reimplementation in `new/`.
 ## COM
 - `CoInitializeEx`
 - `CoUninitialize`
+- `CoCreateInstance`
+- `CoInitializeSecurity` (tests)
 - `CoRegisterClassObject`
 - `CoRevokeClassObject`
+- `CoRegisterPSClsid` (tests)
+
+## RPC / COM Proxy
+- `rpcproxy.h` (proxy/stub DLL)
+- `NdrOleAllocate` (proxy/stub DLL)
+- `NdrOleFree` (proxy/stub DLL)
 
 ## DirectWrite
 - `DWriteCreateFactory`

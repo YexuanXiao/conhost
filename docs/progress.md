@@ -87,7 +87,7 @@
 - Hardened ConDrv server loop cancellation behavior:
   - `release_message_buffers()` and `complete_io()` retries transient `ERROR_OPERATION_ABORTED`/`ERROR_CANCELLED` results so `CancelSynchronousIo` wakeups do not terminate the server after it already serviced client requests.
 - Completed COM `-Embedding` end-to-end integration harness:
-  - added a proxy/stub DLL build from the inbox IDL (MIDL) and per-user registry wiring for deterministic out-of-proc COM activation in tests.
+  - added an in-tree proxy/stub DLL target (no `midl.exe`) and per-user registry wiring for deterministic out-of-proc COM activation in tests.
   - exercised `IConsoleHandoff::EstablishHandoff` end-to-end without relying on the in-memory ConDrv harness.
 - Implemented non-GUI command history support:
   - added a conhost-style command history pool keyed by CONNECT `ApplicationName` and associated with processes.

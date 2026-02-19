@@ -25,8 +25,9 @@ Optionally registers the proxy/stub DLL for `IConsoleHandoff` / `IDefaultTermina
 Most Windows 11 machines already have this registered system-wide, so you usually don't need this.
 
 .PARAMETER ProxyStubPath
-Full path to `oc_new_openconsole_proxy.dll` (built by `new/tests`).
-If omitted and `-RegisterProxyStub` is set, the script tries to resolve `..\..\build-new\tests\oc_new_openconsole_proxy.dll`.
+Full path to `oc_new_openconsole_proxy.dll` (built by the top-level `new/proxy` target).
+If omitted and `-RegisterProxyStub` is set, the script tries to resolve `..\..\build-new\oc_new_openconsole_proxy.dll`
+(and falls back to the legacy `..\..\build-new\tests\oc_new_openconsole_proxy.dll` location).
 
 .EXAMPLE
 .\new\tools\register_default_terminal.ps1 -ExePath (Resolve-Path .\build-new\openconsole_new.exe)
@@ -75,10 +76,18 @@ function Resolve-DefaultExePath {
 }
 
 function Resolve-DefaultProxyStubPath {
-    $candidate = Join-Path $PSScriptRoot '..\..\build-new\tests\oc_new_openconsole_proxy.dll'
-    $resolved = Resolve-Path -LiteralPath $candidate -ErrorAction SilentlyContinue
-    if ($null -ne $resolved) {
-        return $resolved.Path
+    # New location: emitted next to `openconsole_new.exe` in the build root.
+    $candidates = @(
+        (Join-Path $PSScriptRoot '..\..\build-new\oc_new_openconsole_proxy.dll'),
+        # Legacy location used by the earlier test-only build.
+        (Join-Path $PSScriptRoot '..\..\build-new\tests\oc_new_openconsole_proxy.dll')
+    )
+
+    foreach ($candidate in $candidates) {
+        $resolved = Resolve-Path -LiteralPath $candidate -ErrorAction SilentlyContinue
+        if ($null -ne $resolved) {
+            return $resolved.Path
+        }
     }
     return $null
 }
@@ -288,7 +297,7 @@ if ($RegisterProxyStub) {
     }
 
     if ([string]::IsNullOrWhiteSpace($ProxyStubPath)) {
-        throw 'ProxyStubPath is required (or build-new\\tests\\oc_new_openconsole_proxy.dll must exist).'
+        throw 'ProxyStubPath is required (or build-new\\oc_new_openconsole_proxy.dll / build-new\\tests\\oc_new_openconsole_proxy.dll must exist).'
     }
 
     $ProxyStubPath = (Resolve-Path -LiteralPath $ProxyStubPath).Path

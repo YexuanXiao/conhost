@@ -39,7 +39,6 @@ add_library(oc_new_core STATIC
 target_include_directories(oc_new_core
     PUBLIC
         src
-        ${CMAKE_CURRENT_SOURCE_DIR}/../generated
         src/Console
 )
 
@@ -99,6 +98,8 @@ if(MSVC)
         /Zc:__cplusplus
     )
 endif()
+
+add_subdirectory(proxy)
 
 enable_testing()
 add_subdirectory(tests)

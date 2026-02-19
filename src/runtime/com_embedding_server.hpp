@@ -14,7 +14,7 @@
 //   (`condrv::ConDrvServer::run_with_handoff`) to service the session.
 //
 // See also:
-// - `generated/IConsoleHandoff.h` (IDL-generated interface definition)
+// - `new/src/runtime/console_handoff.hpp` (COM interface definition)
 // - `new/docs/conhost_source_architecture.md`
 // - `new/docs/conhost_behavior_imitation_matrix.md`
 

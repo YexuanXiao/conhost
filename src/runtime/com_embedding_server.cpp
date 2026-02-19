@@ -10,7 +10,7 @@
 
 #include <objbase.h>
 
-#include "IConsoleHandoff.h"
+#include "runtime/console_handoff.hpp"
 
 #include <array>
 #include <atomic>
@@ -33,7 +33,7 @@
 // Tests:
 // - Unit tests validate COM registration and handle duplication.
 // - Integration tests validate out-of-proc activation and a round-trip
-//   `EstablishHandoff` call using a generated proxy/stub DLL.
+//   `EstablishHandoff` call using the in-tree proxy/stub DLL.
 //
 // See also:
 // - `new/docs/conhost_behavior_imitation_matrix.md`

@@ -3,7 +3,7 @@
 #include <Windows.h>
 #include <objbase.h>
 
-#include "IConsoleHandoff.h"
+#include "runtime/console_handoff.hpp"
 
 #include <algorithm>
 #include <array>
@@ -122,8 +122,25 @@ namespace
             return std::nullopt;
         }
 
-        std::wstring candidate = join_path(test_dir, L"oc_new_openconsole_proxy.dll");
-        const DWORD attrs = ::GetFileAttributesW(candidate.c_str());
+        constexpr std::wstring_view kProxyName = L"oc_new_openconsole_proxy.dll";
+
+        std::wstring candidate = join_path(test_dir, kProxyName);
+        DWORD attrs = ::GetFileAttributesW(candidate.c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES)
+        {
+            return candidate;
+        }
+
+        // When the proxy DLL is built as a top-level artifact it is emitted next to
+        // `openconsole_new.exe` in the build root (one directory above `tests`).
+        const std::wstring build_root = directory_name(test_dir);
+        if (build_root.empty())
+        {
+            return std::nullopt;
+        }
+
+        candidate = join_path(build_root, kProxyName);
+        attrs = ::GetFileAttributesW(candidate.c_str());
         if (attrs == INVALID_FILE_ATTRIBUTES)
         {
             return std::nullopt;
@@ -727,7 +744,7 @@ namespace
 
         trace(L"establish handoff");
 
-        // The MIDL-generated stubless proxy vtable uses a -1 placeholder for methods that are
+        // The stubless proxy vtable uses a -1 placeholder for methods that are
         // routed through the shared ObjectStublessClientN thunks. In some environments COM may
         // return the unpatched vtable (with -1), which would crash on invocation. Patch the
         // one custom method slot deterministically for the scope of this test.

@@ -16,12 +16,14 @@
 #include "runtime/signal_pipe_monitor.hpp"
 #include "runtime/window_input_sink.hpp"
 
-#include "IConsoleHandoff.h"
+#include "runtime/console_handoff.hpp"
 
 #include <Windows.h>
 #include <conmsgl1.h>
 #include <objbase.h>
 #include <winternl.h>
+
+#include <winrt/base.h>
 
 #include <array>
 #include <cstddef>
@@ -503,63 +505,7 @@ namespace oc::runtime
         };
 
         template<typename T>
-        class UniqueComInterface final
-        {
-        public:
-            UniqueComInterface() noexcept = default;
-
-            ~UniqueComInterface() noexcept
-            {
-                reset();
-            }
-
-            UniqueComInterface(const UniqueComInterface&) = delete;
-            UniqueComInterface& operator=(const UniqueComInterface&) = delete;
-
-            UniqueComInterface(UniqueComInterface&& other) noexcept :
-                _value(other.release())
-            {
-            }
-
-            UniqueComInterface& operator=(UniqueComInterface&& other) noexcept
-            {
-                if (this != &other)
-                {
-                    reset(other.release());
-                }
-                return *this;
-            }
-
-            [[nodiscard]] T* get() const noexcept
-            {
-                return _value;
-            }
-
-            [[nodiscard]] T** put() noexcept
-            {
-                reset();
-                return &_value;
-            }
-
-            void reset(T* replacement = nullptr) noexcept
-            {
-                if (_value != nullptr)
-                {
-                    _value->Release();
-                }
-                _value = replacement;
-            }
-
-            T* release() noexcept
-            {
-                T* detached = _value;
-                _value = nullptr;
-                return detached;
-            }
-
-        private:
-            T* _value{ nullptr };
-        };
+        using ComPtr = winrt::com_ptr<T>;
 
         struct PipePair final
         {
@@ -772,13 +718,13 @@ namespace oc::runtime
                 });
             }
 
-            UniqueComInterface<IConsoleHandoff> handoff{};
+            ComPtr<IConsoleHandoff> handoff{};
             const HRESULT create_hr = ::CoCreateInstance(
                 handoff_clsid,
                 nullptr,
                 CLSCTX_LOCAL_SERVER,
                 __uuidof(IConsoleHandoff),
-                reinterpret_cast<void**>(handoff.put()));
+                handoff.put_void());
             if (FAILED(create_hr))
             {
                 return std::unexpected(SessionError{

@@ -7,7 +7,7 @@
 #include <Windows.h>
 #include <objbase.h>
 
-#include "IConsoleHandoff.h"
+#include "runtime/console_handoff.hpp"
 
 #include <atomic>
 #include <cstdio>
