@@ -40,7 +40,7 @@ target_include_directories(oc_new_core
     PUBLIC
         src
         ${CMAKE_CURRENT_SOURCE_DIR}/../generated
-        ${CMAKE_CURRENT_SOURCE_DIR}/../dep/Console
+        src/Console
 )
 
 target_compile_definitions(oc_new_core
