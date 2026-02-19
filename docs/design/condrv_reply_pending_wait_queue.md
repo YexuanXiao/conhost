@@ -100,7 +100,7 @@ so no client remains hung.
 The server thread normally blocks in `IOCTL_CONDRV_READ_IO`. To retry reply-pending requests promptly when input
 arrives, the input monitor thread can wake the server thread by canceling that synchronous device read.
 
-The replacement uses `CancelSynchronousIo` guarded by two atomics:
+The replacement uses a best-effort wake path guarded by two atomics:
 
 - `has_pending_replies`:
   - True when the pending reply queue is non-empty.
@@ -108,7 +108,16 @@ The replacement uses `CancelSynchronousIo` guarded by two atomics:
   - True only while the server thread is inside `comm->read_io(...)`.
   - Maintained via an RAII guard (`AtomicFlagGuard`).
 
-The input monitor calls `CancelSynchronousIo(server_thread)` only when:
+When the input monitor observes "pending replies exist" and "server is currently blocked in driver read", it attempts
+both:
+
+- `CancelSynchronousIo(server_thread)` (thread-scoped cancellation), and
+- `CancelIoEx(server_handle, nullptr)` (handle-scoped cancellation).
+
+Issuing both cancellations improves wake reliability in environments where `CancelSynchronousIo` alone does not
+consistently interrupt the synchronous `DeviceIoControl(IOCTL_CONDRV_READ_IO)` call used by the server loop.
+
+The input monitor performs the cancellation only when:
 
 - there are pending replies, and
 - the server thread is currently in the driver `read_io` call.

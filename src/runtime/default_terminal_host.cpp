@@ -6,6 +6,7 @@
 #include "core/win32_handle.hpp"
 #include "core/win32_wait.hpp"
 #include "renderer/window_host.hpp"
+#include "runtime/window_input_sink.hpp"
 
 #include <Windows.h>
 
@@ -24,6 +25,7 @@ namespace oc::runtime
             logging::Logger* logger{};
             HWND window{};
             std::shared_ptr<view::PublishedScreenBuffer> published_screen;
+            core::UniqueHandle host_input;
             condrv::IoPacket initial_packet{};
 
             DWORD exit_code{ 0 };
@@ -43,7 +45,7 @@ namespace oc::runtime
                 context->server_handle,
                 context->stop_event,
                 context->input_available_event,
-                core::HandleView{}, // windowed mode: input source is not a byte pipe yet
+                context->host_input.view(), // windowed mode: input is fed from the classic window
                 core::HandleView{}, // windowed mode: output is rendered from published snapshots (no host output pipe)
                 context->host_signal_pipe,
                 context->initial_packet,
@@ -144,10 +146,45 @@ namespace oc::runtime
             });
         }
 
+        core::UniqueHandle host_input_read;
+        core::UniqueHandle host_input_write;
+        {
+            SECURITY_ATTRIBUTES security{};
+            security.nLength = sizeof(security);
+            security.lpSecurityDescriptor = nullptr;
+            security.bInheritHandle = FALSE;
+
+            constexpr DWORD pipe_buffer_bytes = 64 * 1024;
+            if (::CreatePipe(host_input_read.put(), host_input_write.put(), &security, pipe_buffer_bytes) == FALSE)
+            {
+                const DWORD error = ::GetLastError();
+                return std::unexpected(ComEmbeddingError{
+                    .context = L"CreatePipe failed for delegated window input pipe",
+                    .hresult = HRESULT_FROM_WIN32(error),
+                    .win32_error = error,
+                });
+            }
+        }
+
+        std::shared_ptr<renderer::IWindowInputSink> input_sink;
+        try
+        {
+            input_sink = std::make_shared<WindowInputPipeSink>(std::move(host_input_write));
+        }
+        catch (...)
+        {
+            return std::unexpected(ComEmbeddingError{
+                .context = L"Failed to allocate delegated window input sink",
+                .hresult = E_OUTOFMEMORY,
+                .win32_error = ERROR_OUTOFMEMORY,
+            });
+        }
+
         renderer::WindowHostConfig window_config{};
         window_config.title = L"openconsole_new";
         window_config.show_command = SW_SHOWNORMAL;
         window_config.published_screen = published_screen;
+        window_config.input_sink = std::move(input_sink);
 
         logger.log(logging::LogLevel::info, L"Creating delegated window host (--delegated-window)");
         auto window = renderer::WindowHost::create(std::move(window_config), stop_event->view());
@@ -224,6 +261,7 @@ namespace oc::runtime
         server_context->logger = &logger;
         server_context->window = (*window)->hwnd();
         server_context->published_screen = std::move(published_screen);
+        server_context->host_input = std::move(host_input_read);
         server_context->initial_packet = std::move(initial_packet.value());
 
         logger.log(logging::LogLevel::info, L"ConDrv delegated window server worker starting");

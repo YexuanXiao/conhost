@@ -52,6 +52,90 @@ namespace oc::renderer
         constexpr wchar_t k_window_class_name[] = L"OpenConsoleNewWindowHost";
         constexpr UINT k_msg_invalidate = WM_APP + 1;
 
+        [[nodiscard]] WORD repeat_count_from_lparam(const LPARAM lparam) noexcept
+        {
+            const WORD repeat = static_cast<WORD>(lparam & 0xFFFF);
+            return repeat == 0 ? static_cast<WORD>(1) : repeat;
+        }
+
+        [[nodiscard]] DWORD query_control_key_state(const LPARAM lparam) noexcept
+        {
+            DWORD state = 0;
+
+            const auto is_down = [](const int vkey) noexcept -> bool {
+                return (::GetKeyState(vkey) & 0x8000) != 0;
+            };
+
+            const auto is_toggled = [](const int vkey) noexcept -> bool {
+                return (::GetKeyState(vkey) & 0x0001) != 0;
+            };
+
+            if (is_down(VK_LSHIFT) || is_down(VK_RSHIFT))
+            {
+                state |= SHIFT_PRESSED;
+            }
+            if (is_down(VK_LCONTROL))
+            {
+                state |= LEFT_CTRL_PRESSED;
+            }
+            if (is_down(VK_RCONTROL))
+            {
+                state |= RIGHT_CTRL_PRESSED;
+            }
+            if (is_down(VK_LMENU))
+            {
+                state |= LEFT_ALT_PRESSED;
+            }
+            if (is_down(VK_RMENU))
+            {
+                state |= RIGHT_ALT_PRESSED;
+            }
+
+            if (is_toggled(VK_NUMLOCK))
+            {
+                state |= NUMLOCK_ON;
+            }
+            if (is_toggled(VK_CAPITAL))
+            {
+                state |= CAPSLOCK_ON;
+            }
+            if (is_toggled(VK_SCROLL))
+            {
+                state |= SCROLLLOCK_ON;
+            }
+
+            if ((lparam & (1 << 24)) != 0)
+            {
+                state |= ENHANCED_KEY;
+            }
+
+            return state;
+        }
+
+        [[nodiscard]] bool should_forward_non_character_key(const WORD virtual_key) noexcept
+        {
+            switch (virtual_key)
+            {
+            case VK_UP:
+            case VK_DOWN:
+            case VK_LEFT:
+            case VK_RIGHT:
+            case VK_HOME:
+            case VK_END:
+            case VK_PRIOR:
+            case VK_NEXT:
+            case VK_INSERT:
+            case VK_DELETE:
+            case VK_F1:
+            case VK_F2:
+            case VK_F3:
+            case VK_F4:
+                return true;
+            default:
+                return false;
+            }
+        }
+
         [[nodiscard]] ATOM register_window_class() noexcept
         {
             WNDCLASSEXW wc{};
@@ -214,6 +298,39 @@ namespace oc::renderer
     {
         switch (msg)
         {
+        case WM_CHAR:
+        case WM_SYSCHAR:
+            if (_config.input_sink)
+            {
+                KEY_EVENT_RECORD key{};
+                key.bKeyDown = TRUE;
+                key.wRepeatCount = repeat_count_from_lparam(lparam);
+                key.wVirtualKeyCode = 0;
+                key.wVirtualScanCode = 0;
+                key.dwControlKeyState = query_control_key_state(lparam);
+                key.uChar.UnicodeChar = static_cast<wchar_t>(wparam);
+                _config.input_sink->submit_key_event(key);
+            }
+            return 0;
+        case WM_KEYDOWN:
+        case WM_SYSKEYDOWN:
+            if (_config.input_sink)
+            {
+                const WORD virtual_key = static_cast<WORD>(wparam);
+                if (should_forward_non_character_key(virtual_key))
+                {
+                    KEY_EVENT_RECORD key{};
+                    key.bKeyDown = TRUE;
+                    key.wRepeatCount = repeat_count_from_lparam(lparam);
+                    key.wVirtualKeyCode = virtual_key;
+                    key.wVirtualScanCode = static_cast<WORD>((lparam >> 16) & 0xFF);
+                    key.dwControlKeyState = query_control_key_state(lparam);
+                    key.uChar.UnicodeChar = L'\0';
+                    _config.input_sink->submit_key_event(key);
+                    return 0;
+                }
+            }
+            break;
         case k_msg_invalidate:
             if (_hwnd != nullptr)
             {

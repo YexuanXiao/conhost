@@ -432,6 +432,13 @@
   - `OPENCONSOLE_NEW_CONFIG` remains supported and takes precedence over `~/.conhost` when explicitly set.
   - added deterministic tests for user-config loading, precedence, and missing-file behavior.
 
+## 2026-02-19
+- Restored interactive input paths and added diagnostics for both windowed and headless ConPTY hosting:
+  - added classic window keyboard message handling and routed it into the existing byte-stream input pipeline via an internal input pipe (`WindowHost` → `WindowInputPipeSink` → ConDrv host input).
+  - hardened ConPTY reply-pending wake behavior by canceling server `READ_IO` via both `CancelSynchronousIo` (thread-scoped) and `CancelIoEx` (handle-scoped), with trace diagnostics to confirm wake/cancel behavior.
+  - improved startup + ConDrv host I/O logging (handle values/types, handshake emission decisions, and reply-pending visibility) to make input stalls diagnosable from logs.
+  - added a process-isolated raw-read end-to-end integration test (`ReadFile` on stdin) to cover the common "console as byte stream" client behavior.
+
 ## Next Milestone
 
 - Expand **process-isolated integration coverage** for the full startup matrix (`-Embedding`, `--server`, `--headless`, legacy policy combinations) and for more ConDrv behaviors beyond the current end-to-end smoke coverage.

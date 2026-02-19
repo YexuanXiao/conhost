@@ -32,6 +32,7 @@ add_library(oc_new_core STATIC
     src/runtime/session.cpp
     src/runtime/server_handle_validator.cpp
     src/runtime/startup_command.cpp
+    src/runtime/window_input_sink.cpp
     src/serialization/fast_number.cpp
 )
 
@@ -126,6 +127,7 @@ if(OC_NEW_ENABLE_ASAN)
             oc_new_enable_msvc_asan(oc_new_stdio_probe)
             oc_new_enable_msvc_asan(oc_new_condrv_client_smoke)
             oc_new_enable_msvc_asan(oc_new_condrv_client_input_events)
+            oc_new_enable_msvc_asan(oc_new_condrv_client_raw_read)
         else()
             message(WARNING "OC_NEW_ENABLE_ASAN requested, but MSVC AddressSanitizer requires a 64-bit build.")
         endif()

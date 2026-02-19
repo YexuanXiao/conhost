@@ -51,6 +51,7 @@ This document lists Windows APIs used by the reimplementation in `new/`.
 - `DuplicateHandle`
 - `GetCurrentProcess`
 - `CancelSynchronousIo`
+- `CancelIoEx`
 - `DeviceIoControl`
 - `GetHandleInformation`
 - `SetHandleInformation`
@@ -100,6 +101,7 @@ This document lists Windows APIs used by the reimplementation in `new/`.
 ## System Metrics
 - `GetSystemMetrics`
 - `GetKeyboardLayoutNameW`
+- `GetKeyState`
 
 ## Win32 Windowing
 - `RegisterClassExW`

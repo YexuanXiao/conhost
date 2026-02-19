@@ -391,7 +391,9 @@ namespace oc::condrv
         {
             core::HandleView host_input{};
             core::HandleView target_thread{};
+            core::HandleView condrv_server{};
             InputQueue* queue{};
+            logging::Logger* logger{};
             std::atomic_bool stop_requested{ false };
             std::atomic_bool* has_pending_replies{};
             std::atomic_bool* in_driver_read_io{};
@@ -411,6 +413,17 @@ namespace oc::condrv
             if (context == nullptr || context->queue == nullptr)
             {
                 return 0;
+            }
+
+            if (context->logger != nullptr)
+            {
+                const DWORD input_type = context->host_input ? ::GetFileType(context->host_input.get()) : 0;
+                context->logger->log(
+                    logging::LogLevel::trace,
+                    L"Input monitor thread started (host_input=0x{:X}, type={}, condrv_server=0x{:X})",
+                    static_cast<unsigned long long>(context->host_input.as_uintptr()),
+                    static_cast<unsigned long>(input_type),
+                    static_cast<unsigned long long>(context->condrv_server.as_uintptr()));
             }
 
             const auto maybe_wake_server = [&]() noexcept {
@@ -435,7 +448,27 @@ namespace oc::condrv
                     return;
                 }
 
-                (void)::CancelSynchronousIo(context->target_thread.get());
+                const BOOL thread_cancelled = ::CancelSynchronousIo(context->target_thread.get());
+                const DWORD thread_cancel_error = thread_cancelled ? 0 : ::GetLastError();
+
+                BOOL io_cancelled = FALSE;
+                DWORD io_cancel_error = 0;
+                if (context->condrv_server)
+                {
+                    io_cancelled = ::CancelIoEx(context->condrv_server.get(), nullptr);
+                    io_cancel_error = io_cancelled ? 0 : ::GetLastError();
+                }
+
+                if (context->logger != nullptr)
+                {
+                    context->logger->log(
+                        logging::LogLevel::trace,
+                        L"Input monitor wake: CancelSynchronousIo(ok={}, error={}), CancelIoEx(ok={}, error={})",
+                        thread_cancelled ? 1 : 0,
+                        thread_cancel_error,
+                        io_cancelled ? 1 : 0,
+                        io_cancel_error);
+                }
             };
 
             std::array<std::byte, 4096> buffer{};
@@ -472,6 +505,10 @@ namespace oc::condrv
                 }
 
                 context->queue->push(std::span<const std::byte>(buffer.data(), static_cast<size_t>(read)));
+                if (context->logger != nullptr)
+                {
+                    context->logger->log(logging::LogLevel::trace, L"Input monitor read {} bytes from host input", read);
+                }
                 maybe_wake_server();
             }
 
@@ -500,7 +537,9 @@ namespace oc::condrv
                 InputQueue& queue,
                 const core::HandleView target_thread,
                 std::atomic_bool& has_pending_replies,
-                std::atomic_bool& in_driver_read_io) noexcept
+                std::atomic_bool& in_driver_read_io,
+                const core::HandleView condrv_server,
+                logging::Logger* logger) noexcept
             {
                 if (!host_input)
                 {
@@ -520,7 +559,9 @@ namespace oc::condrv
                 InputMonitor monitor{};
                 context->host_input = host_input;
                 context->target_thread = target_thread;
+                context->condrv_server = condrv_server;
                 context->queue = &queue;
+                context->logger = logger;
                 context->has_pending_replies = &has_pending_replies;
                 context->in_driver_read_io = &in_driver_read_io;
 
@@ -873,10 +914,30 @@ namespace oc::condrv
                 input_queue,
                 server_thread.view(),
                 has_pending_replies,
-                in_driver_read_io);
+                in_driver_read_io,
+                comm->server_handle(),
+                &logger);
             if (!input_monitor)
             {
                 return std::unexpected(input_monitor.error());
+            }
+
+            {
+                const DWORD input_type = host_input ? ::GetFileType(host_input.get()) : 0;
+                const DWORD output_type = host_output ? ::GetFileType(host_output.get()) : 0;
+                logger.log(
+                    logging::LogLevel::debug,
+                    L"ConDrv host I/O: host_input=0x{:X} type={}, host_output=0x{:X} type={}, host_signal_pipe=0x{:X}",
+                    static_cast<unsigned long long>(host_input.as_uintptr()),
+                    static_cast<unsigned long>(input_type),
+                    static_cast<unsigned long long>(host_output.as_uintptr()),
+                    static_cast<unsigned long>(output_type),
+                    static_cast<unsigned long long>(host_signal_pipe.as_uintptr()));
+
+                if (!host_input)
+                {
+                    logger.log(logging::LogLevel::warning, L"No host input handle provided; input will be unavailable");
+                }
             }
 
             if (auto server_info = comm->set_server_information(effective_input_event); !server_info)
@@ -1121,6 +1182,23 @@ namespace oc::condrv
 
                 if (outcome->reply_pending)
                 {
+                    if (packet_copy.descriptor.function == console_io_user_defined)
+                    {
+                        logger.log(
+                            logging::LogLevel::trace,
+                            L"Reply-pending: function={} object={} api={}",
+                            packet_copy.descriptor.function,
+                            static_cast<unsigned long long>(packet_copy.descriptor.object),
+                            packet_copy.payload.user_defined.msg_header.ApiNumber);
+                    }
+                    else
+                    {
+                        logger.log(
+                            logging::LogLevel::trace,
+                            L"Reply-pending: function={} object={}",
+                            packet_copy.descriptor.function,
+                            static_cast<unsigned long long>(packet_copy.descriptor.object));
+                    }
                     pending_replies.push_back(std::move(message));
                     update_pending_flag();
                 }
@@ -1180,6 +1258,15 @@ namespace oc::condrv
 
                     if (error == ERROR_OPERATION_ABORTED || error == ERROR_CANCELLED)
                     {
+                        if (stop_requested.load(std::memory_order_acquire))
+                        {
+                            logger.log(logging::LogLevel::trace, L"ConDrv read_io canceled (stop requested)");
+                        }
+                        else
+                        {
+                            logger.log(logging::LogLevel::trace, L"ConDrv read_io canceled (wake)");
+                        }
+
                         if (pending_completion.has_value())
                         {
                             // ReadIo submitted the completion as part of the input buffer before
@@ -1213,6 +1300,23 @@ namespace oc::condrv
 
                 if (outcome->reply_pending)
                 {
+                    if (packet.descriptor.function == console_io_user_defined)
+                    {
+                        logger.log(
+                            logging::LogLevel::trace,
+                            L"Reply-pending: function={} object={} api={}",
+                            packet.descriptor.function,
+                            static_cast<unsigned long long>(packet.descriptor.object),
+                            packet.payload.user_defined.msg_header.ApiNumber);
+                    }
+                    else
+                    {
+                        logger.log(
+                            logging::LogLevel::trace,
+                            L"Reply-pending: function={} object={}",
+                            packet.descriptor.function,
+                            static_cast<unsigned long long>(packet.descriptor.object));
+                    }
                     pending_replies.push_back(std::move(message));
                     update_pending_flag();
                     continue;

@@ -19,6 +19,12 @@
 
 namespace oc::renderer
 {
+    struct IWindowInputSink
+    {
+        virtual ~IWindowInputSink() = default;
+        virtual void submit_key_event(const KEY_EVENT_RECORD& key_event) noexcept = 0;
+    };
+
     struct WindowHostConfig final
     {
         std::wstring title;
@@ -28,6 +34,10 @@ namespace oc::renderer
 
         // Optional output source for windowed `--server` mode.
         std::shared_ptr<view::PublishedScreenBuffer> published_screen;
+
+        // Optional input sink for windowed sessions. When present, keyboard messages are
+        // converted into `KEY_EVENT_RECORD` values and forwarded to the sink.
+        std::shared_ptr<IWindowInputSink> input_sink;
 
         // Rendering defaults (monochrome snapshot rendering uses these knobs).
         std::wstring font_family{ L"Consolas" };

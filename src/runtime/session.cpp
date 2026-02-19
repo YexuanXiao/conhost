@@ -14,6 +14,7 @@
 #include "runtime/console_connection_policy.hpp"
 #include "runtime/server_handle_validator.hpp"
 #include "runtime/signal_pipe_monitor.hpp"
+#include "runtime/window_input_sink.hpp"
 
 #include "IConsoleHandoff.h"
 
@@ -838,6 +839,7 @@ namespace oc::runtime
             HWND window{};
             std::shared_ptr<view::PublishedScreenBuffer> published_screen;
             core::UniqueHandle input_available_event;
+            core::UniqueHandle host_input;
             std::optional<condrv::IoPacket> initial_packet;
 
             DWORD exit_code{ 0 };
@@ -860,7 +862,7 @@ namespace oc::runtime
                     context->server_handle,
                     context->stop_event,
                     context->input_available_event.view(),
-                    core::HandleView{}, // windowed mode: input source is not a byte pipe yet
+                    context->host_input.view(), // windowed mode: input is fed from the classic window
                     core::HandleView{}, // windowed mode: output is rendered from published snapshots (no host output pipe)
                     core::HandleView{},
                     context->initial_packet.value(),
@@ -873,7 +875,7 @@ namespace oc::runtime
                 result = condrv::ConDrvServer::run(
                     context->server_handle,
                     context->stop_event,
-                    core::HandleView{}, // windowed mode: input source is not a byte pipe yet
+                    context->host_input.view(), // windowed mode: input is fed from the classic window
                     core::HandleView{}, // windowed mode: output is rendered from published snapshots (no host output pipe)
                     core::HandleView{},
                     *context->logger,
@@ -959,10 +961,42 @@ namespace oc::runtime
                 });
             }
 
+            core::UniqueHandle host_input_read;
+            core::UniqueHandle host_input_write;
+            {
+                SECURITY_ATTRIBUTES security{};
+                security.nLength = sizeof(security);
+                security.lpSecurityDescriptor = nullptr;
+                security.bInheritHandle = FALSE;
+
+                constexpr DWORD pipe_buffer_bytes = 64 * 1024;
+                if (::CreatePipe(host_input_read.put(), host_input_write.put(), &security, pipe_buffer_bytes) == FALSE)
+                {
+                    return std::unexpected(SessionError{
+                        .context = L"CreatePipe failed for windowed input pipe",
+                        .win32_error = ::GetLastError(),
+                    });
+                }
+            }
+
+            std::shared_ptr<renderer::IWindowInputSink> input_sink;
+            try
+            {
+                input_sink = std::make_shared<WindowInputPipeSink>(std::move(host_input_write));
+            }
+            catch (...)
+            {
+                return std::unexpected(SessionError{
+                    .context = L"Failed to allocate windowed input sink",
+                    .win32_error = ERROR_OUTOFMEMORY,
+                });
+            }
+
             renderer::WindowHostConfig window_config{};
             window_config.title = L"openconsole_new";
             window_config.show_command = show_command;
             window_config.published_screen = published_screen;
+            window_config.input_sink = std::move(input_sink);
             auto window = renderer::WindowHost::create(std::move(window_config), stop_event->view());
             if (!window)
             {
@@ -1025,6 +1059,7 @@ namespace oc::runtime
             server_context->window = (*window)->hwnd();
             server_context->published_screen = std::move(published_screen);
             server_context->input_available_event = std::move(input_available_event);
+            server_context->host_input = std::move(host_input_read);
             server_context->initial_packet = std::move(initial_packet);
 
             core::UniqueHandle server_thread(::CreateThread(
@@ -1370,27 +1405,21 @@ namespace oc::runtime
             STARTUPINFOEXW startup{};
             startup.StartupInfo.cb = sizeof(startup);
             startup.lpAttributeList = attributes.get();
-
-            const HANDLE host_stdin = ::GetStdHandle(STD_INPUT_HANDLE);
-            const HANDLE host_stdout = ::GetStdHandle(STD_OUTPUT_HANDLE);
-            const HANDLE host_stderr = ::GetStdHandle(STD_ERROR_HANDLE);
-
-            // Force explicit stdio selection for the child process. When the
-            // host itself is launched with redirected stdio pipes, inheriting
-            // those handles into the ConPTY client makes it observe redirected
-            // stdin/stdout and bypass the console input path. We keep stdout/
-            // stderr directed to the host so output remains observable, but we
-            // intentionally omit stdin to route input through the pseudo
-            // console transport.
+            // Ensure the ConPTY client sees console-backed standard handles.
+            //
+            // In headless hosting, `openconsole_new` is typically launched with
+            // pipe-like stdio (connected to a terminal). If the client inherits
+            // those handles, it will observe redirected stdin/stdout and many
+            // console applications will treat the session as non-interactive,
+            // bypassing console I/O entirely.
+            //
+            // Passing null standard handles while the pseudo console attribute
+            // is active lets the ConPTY infrastructure provide the appropriate
+            // console handles for stdin/stdout/stderr.
             startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
             startup.StartupInfo.hStdInput = nullptr;
-            startup.StartupInfo.hStdOutput = host_stdout;
-            startup.StartupInfo.hStdError = host_stderr;
-
-            if (host_stdin != nullptr && host_stdin != INVALID_HANDLE_VALUE)
-            {
-                (void)::SetHandleInformation(host_stdin, HANDLE_FLAG_INHERIT, 0);
-            }
+            startup.StartupInfo.hStdOutput = nullptr;
+            startup.StartupInfo.hStdError = nullptr;
 
             PROCESS_INFORMATION info{};
             const BOOL created = ::CreateProcessW(
@@ -1398,7 +1427,7 @@ namespace oc::runtime
                 mutable_command_line.data(),
                 nullptr,
                 nullptr,
-                TRUE,
+                FALSE,
                 EXTENDED_STARTUPINFO_PRESENT,
                 nullptr,
                 nullptr,
@@ -1572,6 +1601,59 @@ namespace oc::runtime
             if (!options.text_measurement.empty())
             {
                 logger.log(logging::LogLevel::debug, L"Requested text measurement mode: {}", options.text_measurement);
+            }
+
+            return {};
+        }
+
+        [[nodiscard]] std::expected<void, SessionError> send_headless_server_terminal_handshake(
+            const SessionOptions& options,
+            logging::Logger& logger) noexcept
+        {
+            // In server-handle headless startup (`--server` + `--headless`), this process *is* the
+            // console server (the "ConPTY conhost"). It is responsible for negotiating the
+            // terminal-side input encoding used by ConPTY.
+            //
+            // Without the win32-input-mode negotiation, many terminal hosts will fall back to
+            // classic VT key sequences. While the replacement supports a minimal subset of those
+            // sequences, richer key metadata (virtual keys, scan codes, modifier state) is required
+            // for many console applications that use `ReadConsoleInput`.
+            //
+            // Upstream conhost uses DA1 + focus events + win32-input-mode as part of the initial
+            // VT startup handshake. Emit the same control sequences here so that headless server
+            // startups remain interactive.
+            if (!options.host_output)
+            {
+                logger.log(logging::LogLevel::debug, L"Skipping VT handshake for headless server startup: no host output handle");
+                return {};
+            }
+
+            // Restrict handshake emission to pipe-backed output handles. When running as a classic
+            // windowed host, stdout is a console screen buffer handle and the downstream consumer
+            // is not a VT terminal.
+            const DWORD output_type = ::GetFileType(options.host_output.get());
+            if (output_type != FILE_TYPE_PIPE)
+            {
+                logger.log(
+                    logging::LogLevel::debug,
+                    L"Skipping VT handshake for headless server startup: host output is not a pipe (type={})",
+                    output_type);
+                return {};
+            }
+
+            logger.log(logging::LogLevel::debug, L"Emitting VT handshake for headless server startup");
+
+            // DA1 + focus mode + win32-input-mode, matching conhost VT startup negotiation.
+            //
+            // Note: `--inheritcursor` is intentionally not handled here yet. Cursor inheritance
+            // requires a DSR CPR query/response exchange that must not leak into client input.
+            // That negotiation is safe in the ConPTY-hosting path because the system conhost
+            // consumes the response, but in server-handle mode we need dedicated handling.
+            constexpr char handshake[] = "\x1b[c\x1b[?1004h\x1b[?9001h";
+            auto result = write_bytes(options.host_output, handshake, static_cast<DWORD>(sizeof(handshake) - 1));
+            if (!result)
+            {
+                return std::unexpected(result.error());
             }
 
             return {};
@@ -1877,6 +1959,10 @@ namespace oc::runtime
 
             bool signaled_termination = false;
             bool host_input_pipe_eof = false;
+            bool process_exited = false;
+            bool draining_after_exit = false;
+            ULONGLONG drain_start_tick = 0;
+            static constexpr ULONGLONG kDrainTimeoutMs = 2'000;
             for (;;)
             {
                 if (options.signal_handle)
@@ -1914,7 +2000,7 @@ namespace oc::runtime
                 }
 
                 bool had_input = false;
-                if (!signaled_termination && !host_input_pipe_eof)
+                if (!process_exited && !signaled_termination && !host_input_pipe_eof)
                 {
                     if (auto input_result = pump_console_input_to_pseudoconsole(
                              options.host_input,
@@ -1930,10 +2016,42 @@ namespace oc::runtime
                 }
 
                 const DWORD process_state = ::WaitForSingleObject(process.get(), 0);
-                const bool process_exited = process_state == WAIT_OBJECT_0;
-                if (process_exited && (!had_output || broken_pipe))
+                if (process_state == WAIT_OBJECT_0)
                 {
-                    break;
+                    process_exited = true;
+                }
+                else if (process_state == WAIT_FAILED)
+                {
+                    return std::unexpected(SessionError{
+                        .context = L"WaitForSingleObject on ConPTY client failed",
+                        .win32_error = ::GetLastError(),
+                    });
+                }
+
+                if (process_exited)
+                {
+                    if (broken_pipe)
+                    {
+                        break;
+                    }
+
+                    if (had_output)
+                    {
+                        draining_after_exit = false;
+                    }
+                    else if (!draining_after_exit)
+                    {
+                        draining_after_exit = true;
+                        drain_start_tick = ::GetTickCount64();
+                    }
+                    else if ((::GetTickCount64() - drain_start_tick) >= kDrainTimeoutMs)
+                    {
+                        logger.log(
+                            logging::LogLevel::debug,
+                            L"ConPTY output drain timed out after {}ms; continuing shutdown",
+                            static_cast<unsigned long long>(kDrainTimeoutMs));
+                        break;
+                    }
                 }
 
                 if (!had_output && !had_input)
@@ -2694,7 +2812,27 @@ namespace oc::runtime
                 return run_windowed_server(options, logger, policy_decision.show_command);
             }
 
+            {
+                const DWORD input_type = options.host_input ? ::GetFileType(options.host_input.get()) : 0;
+                const DWORD output_type = options.host_output ? ::GetFileType(options.host_output.get()) : 0;
+                const DWORD signal_type = options.signal_handle ? ::GetFileType(options.signal_handle.get()) : 0;
+
+                logger.log(
+                    logging::LogLevel::debug,
+                    L"Server-handle startup: headless={}, conpty={}, server_handle=0x{:X}, host_input=0x{:X}(type={}), host_output=0x{:X}(type={}), signal_handle=0x{:X}(type={})",
+                    options.headless ? 1 : 0,
+                    options.in_conpty_mode ? 1 : 0,
+                    static_cast<unsigned long long>(options.server_handle.as_uintptr()),
+                    static_cast<unsigned long long>(options.host_input.as_uintptr()),
+                    static_cast<unsigned long>(input_type),
+                    static_cast<unsigned long long>(options.host_output.as_uintptr()),
+                    static_cast<unsigned long>(output_type),
+                    static_cast<unsigned long long>(options.signal_handle.as_uintptr()),
+                    static_cast<unsigned long>(signal_type));
+            }
+
             core::HandleView stop_signal = options.signal_handle;
+            core::HandleView host_signal_pipe{};
             core::UniqueHandle stop_event;
             std::optional<SignalPipeMonitor> signal_pipe_monitor;
 
@@ -2703,6 +2841,8 @@ namespace oc::runtime
                 const DWORD signal_type = ::GetFileType(options.signal_handle.get());
                 if (signal_type == FILE_TYPE_PIPE)
                 {
+                    host_signal_pipe = options.signal_handle;
+
                     // In ConPTY/server-handle startup (commonly referred to as "0x4" in upstream),
                     // the `--signal` handle is a pipe. It is *not* a waitable shutdown event.
                     //
@@ -2743,12 +2883,23 @@ namespace oc::runtime
                 }
             }
 
+            logger.log(
+                logging::LogLevel::debug,
+                L"Server-handle stop signal: stop_signal=0x{:X}, signal_pipe_monitor_active={}",
+                static_cast<unsigned long long>(stop_signal.as_uintptr()),
+                signal_pipe_monitor.has_value() ? 1 : 0);
+
+            if (auto handshake = send_headless_server_terminal_handshake(options, logger); !handshake)
+            {
+                return std::unexpected(handshake.error());
+            }
+
             auto server_result = condrv::ConDrvServer::run(
                 options.server_handle,
                 stop_signal,
                 options.host_input,
                 options.host_output,
-                core::HandleView{},
+                host_signal_pipe,
                 logger);
             if (!server_result)
             {

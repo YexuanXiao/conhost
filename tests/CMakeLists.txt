@@ -110,6 +110,11 @@ add_executable(oc_new_condrv_client_input_events
 )
 target_link_libraries(oc_new_condrv_client_input_events PRIVATE oc_new_core)
 
+add_executable(oc_new_condrv_client_raw_read
+    condrv_client_raw_read.cpp
+)
+target_link_libraries(oc_new_condrv_client_raw_read PRIVATE oc_new_core)
+
 if(MSVC)
     target_compile_options(oc_new_tests PRIVATE
         /W4
@@ -122,7 +127,7 @@ if(MSVC)
     )
 endif()
 
-add_dependencies(oc_new_tests openconsole_new oc_new_embedding_test_host oc_new_stdio_probe oc_new_condrv_client_smoke oc_new_condrv_client_input_events oc_new_openconsole_proxy_dll)
+add_dependencies(oc_new_tests openconsole_new oc_new_embedding_test_host oc_new_stdio_probe oc_new_condrv_client_smoke oc_new_condrv_client_input_events oc_new_condrv_client_raw_read oc_new_openconsole_proxy_dll)
 add_dependencies(oc_new_embedding_test_host oc_new_openconsole_proxy_dll)
 
 add_test(NAME oc_new_tests COMMAND oc_new_tests)
