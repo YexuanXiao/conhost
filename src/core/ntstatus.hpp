@@ -10,6 +10,7 @@
 // Values are defined by Windows and are stable.
 
 #include <Windows.h>
+#include <winternl.h>
 
 namespace oc::core
 {
