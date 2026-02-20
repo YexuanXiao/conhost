@@ -1,5 +1,6 @@
 add_library(oc_new_openconsole_proxy SHARED
     console_handoff_proxy.cpp
+    terminal_handoff_proxy.cpp
     console_handoff_iids.cpp
     dlldata.cpp
 )
@@ -23,6 +24,7 @@ target_compile_definitions(oc_new_openconsole_proxy PRIVATE
 target_link_libraries(oc_new_openconsole_proxy PRIVATE
     rpcrt4
     ole32
+    oleaut32
 )
 
 set_target_properties(oc_new_openconsole_proxy PROPERTIES

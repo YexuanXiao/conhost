@@ -11,7 +11,7 @@ This script performs two operations (HKCU only, no admin):
 2) Sets `HKCU\Console\%%Startup\DelegationConsole` to that CLSID.
 
 This targets the *classic* console-host handoff (`IConsoleHandoff` / `DelegationConsole`).
-It does NOT configure ConPTY terminal handoff (`DelegationTerminal` / `ITerminalHandoff*`).
+It can optionally configure ConPTY terminal handoff (`DelegationTerminal` / `ITerminalHandoff*`).
 
 .PARAMETER ExePath
 Full path to `openconsole_new.exe`.
@@ -19,6 +19,10 @@ If omitted, the script tries to resolve `..\..\build-new\openconsole_new.exe` re
 
 .PARAMETER Uninstall
 Removes the per-user `DelegationConsole` value and (if it looks like ours) the per-user COM registration.
+
+.PARAMETER EnableDelegationTerminal
+Also sets `HKCU\Console\%%Startup\DelegationTerminal` to the handoff CLSID so ConPTY/terminal handoff
+(`ITerminalHandoff*`) can delegate to `openconsole_new`.
 
 .PARAMETER RegisterProxyStub
 Optionally registers the proxy/stub DLL for `IConsoleHandoff` / `IDefaultTerminalMarker` marshalling in HKCU.
@@ -45,6 +49,9 @@ param(
     [switch]$Uninstall,
 
     [Parameter()]
+    [switch]$EnableDelegationTerminal,
+
+    [Parameter()]
     [switch]$RegisterProxyStub,
 
     [Parameter()]
@@ -61,6 +68,11 @@ $ConsoleHandoffClsid = '{1F9F2BF5-5BC3-4F17-B0E6-912413F1F451}'
 # IID values from `src/host/proxy/IConsoleHandoff.idl`.
 $IConsoleHandoffIid = '{E686C757-9A35-4A1C-B3CE-0BCC8B5C69F4}'
 $IDefaultTerminalMarkerIid = '{746E6BC0-AB05-4E38-AB14-71E86763141F}'
+
+# IID values from `src/host/proxy/ITerminalHandoff.idl`.
+$ITerminalHandoffIid = '{59D55CCE-FC8A-48B4-ACE8-0A9286C6557F}'
+$ITerminalHandoff2Iid = '{AA6B364F-4A50-4176-9002-0AE755E7B5EF}'
+$ITerminalHandoff3Iid = '{6F23DA90-15C5-4203-9DB0-64E73F1B1B00}'
 
 # Proxy/stub CLSID used by upstream OpenConsoleProxy for the unbranded/dev build.
 # Matches `new/tests/com_embedding_integration_tests.cpp`.
@@ -158,6 +170,25 @@ function Ensure-DelegationConsoleValue {
     }
 }
 
+function Ensure-DelegationTerminalValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ClsidString
+    )
+
+    $startupKeyPath = 'Console\%%Startup'
+    $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($startupKeyPath, $true)
+    if ($null -eq $key) {
+        throw 'Failed to create/open HKCU\Console\%%Startup'
+    }
+
+    try {
+        $key.SetValue('DelegationTerminal', $ClsidString, [Microsoft.Win32.RegistryValueKind]::String)
+    } finally {
+        $key.Close()
+    }
+}
+
 function Remove-DelegationConsoleValue {
     $startupKeyPath = 'Console\%%Startup'
     $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($startupKeyPath, $true)
@@ -167,6 +198,20 @@ function Remove-DelegationConsoleValue {
 
     try {
         $key.DeleteValue('DelegationConsole', $false)
+    } finally {
+        $key.Close()
+    }
+}
+
+function Remove-DelegationTerminalValue {
+    $startupKeyPath = 'Console\%%Startup'
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($startupKeyPath, $true)
+    if ($null -eq $key) {
+        return
+    }
+
+    try {
+        $key.DeleteValue('DelegationTerminal', $false)
     } finally {
         $key.Close()
     }
@@ -214,7 +259,10 @@ function Register-ProxyStubInHkcu {
 
     $interfaceKeys = @(
         "Software\Classes\Interface\$IConsoleHandoffIid\ProxyStubClsid32",
-        "Software\Classes\Interface\$IDefaultTerminalMarkerIid\ProxyStubClsid32"
+        "Software\Classes\Interface\$IDefaultTerminalMarkerIid\ProxyStubClsid32",
+        "Software\Classes\Interface\$ITerminalHandoffIid\ProxyStubClsid32",
+        "Software\Classes\Interface\$ITerminalHandoff2Iid\ProxyStubClsid32",
+        "Software\Classes\Interface\$ITerminalHandoff3Iid\ProxyStubClsid32"
     )
 
     foreach ($path in $interfaceKeys) {
@@ -236,6 +284,9 @@ function Unregister-ProxyStubInHkcu {
     $paths = @(
         "Software\Classes\Interface\$IConsoleHandoffIid\ProxyStubClsid32",
         "Software\Classes\Interface\$IDefaultTerminalMarkerIid\ProxyStubClsid32",
+        "Software\Classes\Interface\$ITerminalHandoffIid\ProxyStubClsid32",
+        "Software\Classes\Interface\$ITerminalHandoff2Iid\ProxyStubClsid32",
+        "Software\Classes\Interface\$ITerminalHandoff3Iid\ProxyStubClsid32",
         "Software\Classes\CLSID\$OpenConsoleProxyClsid\InprocServer32"
     )
 
@@ -249,6 +300,9 @@ function Unregister-ProxyStubInHkcu {
 if ($Uninstall) {
     if ($PSCmdlet.ShouldProcess('HKCU\\Console\\%%Startup', 'Remove DelegationConsole')) {
         Remove-DelegationConsoleValue
+    }
+    if ($PSCmdlet.ShouldProcess('HKCU\\Console\\%%Startup', 'Remove DelegationTerminal')) {
+        Remove-DelegationTerminalValue
     }
 
     $handoffServerKey = "Software\Classes\CLSID\$ConsoleHandoffClsid\LocalServer32"
@@ -289,6 +343,12 @@ Register-ComLocalServerForHandoff -ExePathResolved $ExePath
 
 if ($PSCmdlet.ShouldProcess('HKCU\\Console\\%%Startup', "Set DelegationConsole to $ConsoleHandoffClsid")) {
     Ensure-DelegationConsoleValue -ClsidString $ConsoleHandoffClsid
+}
+
+if ($EnableDelegationTerminal) {
+    if ($PSCmdlet.ShouldProcess('HKCU\\Console\\%%Startup', "Set DelegationTerminal to $ConsoleHandoffClsid")) {
+        Ensure-DelegationTerminalValue -ClsidString $ConsoleHandoffClsid
+    }
 }
 
 if ($RegisterProxyStub) {

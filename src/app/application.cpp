@@ -12,6 +12,7 @@
 #include "runtime/legacy_conhost.hpp"
 #include "runtime/session.hpp"
 #include "runtime/startup_command.hpp"
+#include "runtime/terminal_handoff_host.hpp"
 
 #include <Windows.h>
 
@@ -155,12 +156,15 @@ namespace oc::app
                 logger.log(logging::LogLevel::info, L"Delegated window mode requested; hosting classic window for default-terminal handoff");
             }
 
-            auto com_server_result = windowed_default_terminal
-                ? runtime::ComEmbeddingServer::run_with_runner(
-                      logger,
-                      config.embedding_wait_timeout_ms,
-                      &runtime::run_windowed_default_terminal_host)
-                : runtime::ComEmbeddingServer::run(logger, config.embedding_wait_timeout_ms);
+            const auto terminal_runner = config.hold_window_on_exit
+                ? &runtime::run_windowed_terminal_handoff_host_hold
+                : &runtime::run_windowed_terminal_handoff_host;
+
+            auto com_server_result = runtime::ComEmbeddingServer::run_with_runners(
+                logger,
+                config.embedding_wait_timeout_ms,
+                windowed_default_terminal ? &runtime::run_windowed_default_terminal_host : nullptr,
+                terminal_runner);
             if (!com_server_result)
             {
                 logger.log(

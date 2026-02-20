@@ -32,6 +32,7 @@ add_library(oc_new_core STATIC
     src/runtime/session.cpp
     src/runtime/server_handle_validator.cpp
     src/runtime/startup_command.cpp
+    src/runtime/terminal_handoff_host.cpp
     src/runtime/window_input_sink.cpp
     src/serialization/fast_number.cpp
 )

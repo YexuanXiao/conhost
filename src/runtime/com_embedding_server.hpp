@@ -19,6 +19,7 @@
 // - `new/docs/conhost_behavior_imitation_matrix.md`
 
 #include "core/handle_view.hpp"
+#include "core/unique_handle.hpp"
 #include "logging/logger.hpp"
 
 #include <Windows.h>
@@ -54,6 +55,30 @@ namespace oc::runtime
         PortableAttachMessage attach{};
     };
 
+    struct TerminalHandoffPayload final
+    {
+        // Terminal-side ends for the ConPTY byte transport.
+        // - `terminal_input`: bytes written to the console server (stdin).
+        // - `terminal_output`: bytes read from the console server (stdout/stderr).
+        core::UniqueHandle terminal_input;
+        core::UniqueHandle terminal_output;
+
+        // Write-only host-signal pipe provided by the console server.
+        // Closing this handle requests termination from the server.
+        core::UniqueHandle signal_pipe;
+
+        // ConDrv console reference handle (opened relative to the server handle).
+        core::UniqueHandle reference;
+
+        // Optional process handles for lifetime tracking (provided by the server).
+        core::UniqueHandle server_process;
+        core::UniqueHandle client_process;
+
+        std::wstring title;
+        COORD initial_size{ 80, 25 };
+        int show_command{ SW_SHOWNORMAL };
+    };
+
     struct ComEmbeddingError final
     {
         std::wstring context;
@@ -65,8 +90,26 @@ namespace oc::runtime
     {
     public:
         using HandoffRunner = std::expected<DWORD, ComEmbeddingError> (*)(const ComHandoffPayload& payload, logging::Logger& logger) noexcept;
+        using TerminalHandoffRunner = std::expected<DWORD, ComEmbeddingError> (*)(TerminalHandoffPayload payload, logging::Logger& logger) noexcept;
 
         [[nodiscard]] static std::expected<DWORD, ComEmbeddingError> run(logging::Logger& logger, DWORD wait_timeout_ms) noexcept;
+
+        // Runs the COM registration + capture loop, then invokes a runner for
+        // whichever embedding interface was activated:
+        // - `IConsoleHandoff` -> `console_runner` (or the default runner when null),
+        // - `ITerminalHandoff*` -> `terminal_runner` (must be provided to support terminal handoff).
+        [[nodiscard]] static std::expected<DWORD, ComEmbeddingError> run_with_runners(
+            logging::Logger& logger,
+            DWORD wait_timeout_ms,
+            HandoffRunner console_runner,
+            TerminalHandoffRunner terminal_runner) noexcept;
+
+        // Convenience wrapper for production use: uses the default console handoff
+        // runner and supports terminal handoff via the provided runner.
+        [[nodiscard]] static std::expected<DWORD, ComEmbeddingError> run_with_terminal_runner(
+            logging::Logger& logger,
+            DWORD wait_timeout_ms,
+            TerminalHandoffRunner terminal_runner) noexcept;
 
         // Test hook: runs the COM registration + handoff capture, then invokes
         // the provided runner with the duplicated handles and attach message.

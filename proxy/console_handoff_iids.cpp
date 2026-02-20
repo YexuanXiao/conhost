@@ -5,9 +5,13 @@
 // by `rpcproxy.h`-based proxy DLLs.
 
 #include "runtime/console_handoff.hpp"
+#include "runtime/terminal_handoff_com.hpp"
 
 extern "C"
 {
     extern const IID IID_IConsoleHandoff = __uuidof(IConsoleHandoff);
     extern const IID IID_IDefaultTerminalMarker = __uuidof(IDefaultTerminalMarker);
+    extern const IID IID_ITerminalHandoff = __uuidof(ITerminalHandoff);
+    extern const IID IID_ITerminalHandoff2 = __uuidof(ITerminalHandoff2);
+    extern const IID IID_ITerminalHandoff3 = __uuidof(ITerminalHandoff3);
 }

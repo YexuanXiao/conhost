@@ -7,6 +7,8 @@ Windows 10/11 select the “default terminal application” for console sessions
 
 `openconsole_new` currently implements the **console host handoff** (`IConsoleHandoff`) COM server behind `-Embedding`.
 
+It also implements the **terminal UI handoff** (`ITerminalHandoff*`, currently `ITerminalHandoff3`) behind `-Embedding`.
+
 The CLSID used by this repo is the upstream “unbranded” OpenConsole handoff CLSID:
 
 - `{1F9F2BF5-5BC3-4F17-B0E6-912413F1F451}` (see `new/src/runtime/com_embedding_server.cpp:56`)
@@ -30,9 +32,17 @@ The CLSID used by this repo is the upstream “unbranded” OpenConsole handoff 
    - Registry key: `HKCU\Console\%%Startup`
    - Value (REG_SZ): `DelegationConsole` = `{1F9F2BF5-5BC3-4F17-B0E6-912413F1F451}`
 
-You can do steps (2) and (3) with the helper script:
+4. (Optional) Enable ConPTY terminal UI delegation too:
+   - Registry key: `HKCU\Console\%%Startup`
+   - Value (REG_SZ): `DelegationTerminal` = `{1F9F2BF5-5BC3-4F17-B0E6-912413F1F451}`
+
+You can do steps (2) and (3) (and optionally (4)) with the helper script:
 ```powershell
 .\new\tools\register_default_terminal.ps1 -ExePath (Resolve-Path .\build-new\openconsole_new.exe)
+```
+To enable `DelegationTerminal` too:
+```powershell
+.\new\tools\register_default_terminal.ps1 -ExePath (Resolve-Path .\build-new\openconsole_new.exe) -EnableDelegationTerminal
 ```
 
 ## 2) Verify
@@ -51,8 +61,7 @@ To revert to “Let Windows decide” / previous default, remove the override va
 
 ## Notes / limitations
 
-- Do **not** set `DelegationTerminal` to `openconsole_new` unless/until this repo implements `ITerminalHandoff*`.
-  `DelegationTerminal` is for ConPTY terminal UI handoff, not classic console host handoff.
+- `DelegationTerminal` uses the ConPTY byte transport. Window resize propagation is still incremental.
 - The classic window host is still incremental: rendering is implemented, but keyboard/mouse input injection is a follow-up
   (see `docs/design/renderer_window_host.md`).
 - COM registration is per-user (HKCU) so it overrides machine registrations (HKLM) without admin rights.

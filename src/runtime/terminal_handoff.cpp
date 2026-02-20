@@ -2,6 +2,7 @@
 
 #include "core/win32_handle.hpp"
 #include "logging/logger.hpp"
+#include "runtime/terminal_handoff_com.hpp"
 
 #include <Windows.h>
 #include <objbase.h>
@@ -246,34 +247,6 @@ namespace oc::runtime
 
         private:
             T* _value{ nullptr };
-        };
-
-        struct TerminalStartupInfo final
-        {
-            BSTR title{};
-            BSTR icon_path{};
-            LONG icon_index{};
-            DWORD x{};
-            DWORD y{};
-            DWORD x_size{};
-            DWORD y_size{};
-            DWORD x_count_chars{};
-            DWORD y_count_chars{};
-            DWORD fill_attribute{};
-            DWORD flags{};
-            WORD show_window{};
-        };
-
-        struct __declspec(uuid("6F23DA90-15C5-4203-9DB0-64E73F1B1B00")) ITerminalHandoff3 : ::IUnknown
-        {
-            virtual HRESULT __stdcall EstablishPtyHandoff(
-                HANDLE* in_pipe,
-                HANDLE* out_pipe,
-                HANDLE signal_pipe,
-                HANDLE reference,
-                HANDLE server,
-                HANDLE client,
-                const TerminalStartupInfo* startup_info) = 0;
         };
 
         struct NtdllApi final
@@ -577,8 +550,8 @@ namespace oc::runtime
                     client_process.error()));
             }
 
-            TerminalStartupInfo startup_info{};
-            startup_info.show_window = SW_SHOWNORMAL;
+            TERMINAL_STARTUP_INFO startup_info{};
+            startup_info.wShowWindow = SW_SHOWNORMAL;
 
             HANDLE host_input = nullptr;
             HANDLE host_output = nullptr;

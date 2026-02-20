@@ -8,11 +8,12 @@
 extern "C"
 {
     EXTERN_PROXY_FILE(IConsoleHandoff)
+    EXTERN_PROXY_FILE(ITerminalHandoff)
 
     PROXYFILE_LIST_START
         REFERENCE_PROXY_FILE(IConsoleHandoff),
+        REFERENCE_PROXY_FILE(ITerminalHandoff),
     PROXYFILE_LIST_END
 
     DLLDATA_ROUTINES(aProxyFileList, GET_DLL_CLSID)
 }
-

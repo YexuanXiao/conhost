@@ -6,15 +6,19 @@
 #include "core/handle_view.hpp"
 #include "core/unique_handle.hpp"
 #include "core/win32_handle.hpp"
+#include "runtime/console_handoff.hpp"
 #include "runtime/server_handle_validator.hpp"
+#include "runtime/terminal_handoff_com.hpp"
 
 #include <objbase.h>
 
-#include "runtime/console_handoff.hpp"
-
 #include <array>
 #include <atomic>
+#include <cwchar>
+#include <new>
+#include <optional>
 #include <string_view>
+#include <utility>
 
 // `runtime/com_embedding_server.cpp` implements the out-of-proc COM local server
 // for `-Embedding` startup.
@@ -46,11 +50,12 @@ namespace oc::runtime
         // The embedding server accepts exactly one handoff and then exits.
         // This mirrors how upstream OpenConsole uses `REGCLS_SINGLEUSE` and
         // keeps lifecycle predictable for the inbox host.
-        enum class HandoffCompletionState : LONG
+        enum class EmbeddingCompletionState : LONG
         {
             pending = 0,
-            succeeded = 1,
-            failed = 2,
+            console_succeeded = 1,
+            terminal_succeeded = 2,
+            failed = 3,
         };
 
         // Default OpenConsole class ID from upstream non-branded branch.
@@ -204,24 +209,44 @@ namespace oc::runtime
             void set_failed(const HRESULT hr) noexcept
             {
                 _failure_hr = hr;
-                _state.store(static_cast<LONG>(HandoffCompletionState::failed), std::memory_order_release);
+                _failure_context = L"COM embedding handoff failed";
+                _state.store(static_cast<LONG>(EmbeddingCompletionState::failed), std::memory_order_release);
                 signal_completion_event();
             }
 
-            void set_succeeded() noexcept
+            void set_failed_with_context(const wchar_t* const context, const HRESULT hr) noexcept
             {
-                _state.store(static_cast<LONG>(HandoffCompletionState::succeeded), std::memory_order_release);
+                _failure_hr = hr;
+                _failure_context = context;
+                _state.store(static_cast<LONG>(EmbeddingCompletionState::failed), std::memory_order_release);
                 signal_completion_event();
             }
 
-            [[nodiscard]] HandoffCompletionState state() const noexcept
+            void set_console_succeeded() noexcept
             {
-                return static_cast<HandoffCompletionState>(_state.load(std::memory_order_acquire));
+                _state.store(static_cast<LONG>(EmbeddingCompletionState::console_succeeded), std::memory_order_release);
+                signal_completion_event();
+            }
+
+            void set_terminal_succeeded() noexcept
+            {
+                _state.store(static_cast<LONG>(EmbeddingCompletionState::terminal_succeeded), std::memory_order_release);
+                signal_completion_event();
+            }
+
+            [[nodiscard]] EmbeddingCompletionState state() const noexcept
+            {
+                return static_cast<EmbeddingCompletionState>(_state.load(std::memory_order_acquire));
             }
 
             [[nodiscard]] HRESULT failure_hr() const noexcept
             {
                 return _failure_hr;
+            }
+
+            [[nodiscard]] const wchar_t* failure_context() const noexcept
+            {
+                return _failure_context;
             }
 
             [[nodiscard]] HRESULT duplicate_incoming_handles(
@@ -307,6 +332,88 @@ namespace oc::runtime
                 return _attach_msg;
             }
 
+            [[nodiscard]] HRESULT duplicate_terminal_payload(
+                const core::HandleView terminal_input,
+                const core::HandleView terminal_output,
+                const core::HandleView signal_pipe,
+                const core::HandleView reference,
+                const core::HandleView server_process,
+                const core::HandleView client_process,
+                const TERMINAL_STARTUP_INFO* const startup_info) noexcept
+            {
+                TerminalHandoffPayload payload{};
+
+                const auto duplicate = [](const core::HandleView in, core::UniqueHandle& out) noexcept -> HRESULT {
+                    if (!in)
+                    {
+                        return S_OK;
+                    }
+
+                    auto duplicated = core::duplicate_handle_same_access(in, false);
+                    if (!duplicated)
+                    {
+                        return HRESULT_FROM_WIN32(duplicated.error());
+                    }
+
+                    out = std::move(duplicated.value());
+                    return S_OK;
+                };
+
+                if (const HRESULT hr = duplicate(terminal_input, payload.terminal_input); FAILED(hr))
+                {
+                    return hr;
+                }
+                if (const HRESULT hr = duplicate(terminal_output, payload.terminal_output); FAILED(hr))
+                {
+                    return hr;
+                }
+                if (const HRESULT hr = duplicate(signal_pipe, payload.signal_pipe); FAILED(hr))
+                {
+                    return hr;
+                }
+                if (const HRESULT hr = duplicate(reference, payload.reference); FAILED(hr))
+                {
+                    return hr;
+                }
+                if (const HRESULT hr = duplicate(server_process, payload.server_process); FAILED(hr))
+                {
+                    return hr;
+                }
+                if (const HRESULT hr = duplicate(client_process, payload.client_process); FAILED(hr))
+                {
+                    return hr;
+                }
+
+                if (startup_info != nullptr)
+                {
+                    if (startup_info->pszTitle != nullptr)
+                    {
+                        payload.title.assign(startup_info->pszTitle, startup_info->pszTitle + ::wcslen(startup_info->pszTitle));
+                    }
+
+                    if (startup_info->dwXCountChars != 0 && startup_info->dwYCountChars != 0)
+                    {
+                        const DWORD width = startup_info->dwXCountChars > 32'767 ? 32'767 : startup_info->dwXCountChars;
+                        const DWORD height = startup_info->dwYCountChars > 32'767 ? 32'767 : startup_info->dwYCountChars;
+                        payload.initial_size = COORD{ static_cast<SHORT>(width), static_cast<SHORT>(height) };
+                    }
+
+                    payload.show_command = startup_info->wShowWindow == 0 ? SW_SHOWNORMAL : static_cast<int>(startup_info->wShowWindow);
+                }
+
+                _terminal_payload.emplace(std::move(payload));
+                return S_OK;
+            }
+
+            void move_terminal_payload_into(TerminalHandoffPayload& out) noexcept
+            {
+                if (_terminal_payload.has_value())
+                {
+                    out = std::move(_terminal_payload.value());
+                    _terminal_payload.reset();
+                }
+            }
+
         private:
             void signal_completion_event() const noexcept
             {
@@ -322,10 +429,12 @@ namespace oc::runtime
             core::UniqueHandle _signal_pipe;
             core::UniqueHandle _inbox_process;
             PortableAttachMessage _attach_msg{};
+            std::optional<TerminalHandoffPayload> _terminal_payload;
 
             std::atomic<bool> _establish_called{ false };
-            std::atomic<LONG> _state{ static_cast<LONG>(HandoffCompletionState::pending) };
+            std::atomic<LONG> _state{ static_cast<LONG>(EmbeddingCompletionState::pending) };
             HRESULT _failure_hr{ S_OK };
+            const wchar_t* _failure_context{ L"COM embedding handoff failed" };
         };
 
         [[nodiscard]] std::expected<DWORD, ComEmbeddingError> default_handoff_runner(
@@ -403,11 +512,32 @@ namespace oc::runtime
             return *result;
         }
 
-        class ConsoleHandoffObject final : public IConsoleHandoff, public IDefaultTerminalMarker
+        [[nodiscard]] HRESULT create_pipe_pair(core::UniqueHandle& read_end, core::UniqueHandle& write_end, const DWORD buffer_bytes) noexcept
+        {
+            SECURITY_ATTRIBUTES security{};
+            security.nLength = sizeof(security);
+            security.lpSecurityDescriptor = nullptr;
+            security.bInheritHandle = FALSE;
+
+            if (::CreatePipe(read_end.put(), write_end.put(), &security, buffer_bytes) == FALSE)
+            {
+                return HRESULT_FROM_WIN32(::GetLastError());
+            }
+
+            return S_OK;
+        }
+
+        class EmbeddingHandoffObject final :
+            public IConsoleHandoff,
+            public IDefaultTerminalMarker,
+            public ITerminalHandoff,
+            public ITerminalHandoff2,
+            public ITerminalHandoff3
         {
         public:
-            explicit ConsoleHandoffObject(HandoffState* const state) noexcept :
-                _state(state)
+            EmbeddingHandoffObject(HandoffState* const state, const bool supports_terminal_handoff) noexcept :
+                _state(state),
+                _supports_terminal_handoff(supports_terminal_handoff)
             {
             }
 
@@ -426,6 +556,18 @@ namespace oc::runtime
                 else if (riid == __uuidof(IDefaultTerminalMarker))
                 {
                     *object = static_cast<IDefaultTerminalMarker*>(this);
+                }
+                else if (_supports_terminal_handoff && riid == __uuidof(ITerminalHandoff))
+                {
+                    *object = static_cast<ITerminalHandoff*>(this);
+                }
+                else if (_supports_terminal_handoff && riid == __uuidof(ITerminalHandoff2))
+                {
+                    *object = static_cast<ITerminalHandoff2*>(this);
+                }
+                else if (_supports_terminal_handoff && riid == __uuidof(ITerminalHandoff3))
+                {
+                    *object = static_cast<ITerminalHandoff3*>(this);
                 }
                 else
                 {
@@ -466,14 +608,14 @@ namespace oc::runtime
 
                 if (process == nullptr || msg == nullptr)
                 {
-                    _state->set_failed(E_INVALIDARG);
+                    _state->set_failed_with_context(L"IConsoleHandoff::EstablishHandoff failed", E_INVALIDARG);
                     return E_INVALIDARG;
                 }
 
                 if (!_state->try_begin_establish())
                 {
                     const HRESULT hr = HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
-                    _state->set_failed(hr);
+                    _state->set_failed_with_context(L"IConsoleHandoff::EstablishHandoff already called", hr);
                     return hr;
                 }
 
@@ -485,7 +627,7 @@ namespace oc::runtime
                         core::HandleView(inboxProcess));
                     FAILED(hr))
                 {
-                    _state->set_failed(hr);
+                    _state->set_failed_with_context(L"IConsoleHandoff::EstablishHandoff handle duplication failed", hr);
                     return hr;
                 }
 
@@ -493,25 +635,194 @@ namespace oc::runtime
                 if (!self_process)
                 {
                     const HRESULT hr = HRESULT_FROM_WIN32(self_process.error());
-                    _state->set_failed(hr);
+                    _state->set_failed_with_context(L"IConsoleHandoff::EstablishHandoff failed to duplicate process handle", hr);
                     return hr;
                 }
 
                 *process = self_process.value().release();
-                _state->set_succeeded();
+                _state->set_console_succeeded();
+                return S_OK;
+            }
+
+            HRESULT STDMETHODCALLTYPE EstablishPtyHandoff(
+                HANDLE in_pipe,
+                HANDLE out_pipe,
+                HANDLE signal_pipe,
+                HANDLE reference,
+                HANDLE server_process,
+                HANDLE client_process) override
+            {
+                return establish_terminal_handoff_v1(
+                    in_pipe,
+                    out_pipe,
+                    signal_pipe,
+                    reference,
+                    server_process,
+                    client_process,
+                    nullptr);
+            }
+
+            HRESULT STDMETHODCALLTYPE EstablishPtyHandoff(
+                HANDLE in_pipe,
+                HANDLE out_pipe,
+                HANDLE signal_pipe,
+                HANDLE reference,
+                HANDLE server_process,
+                HANDLE client_process,
+                TERMINAL_STARTUP_INFO startup_info) override
+            {
+                return establish_terminal_handoff_v1(
+                    in_pipe,
+                    out_pipe,
+                    signal_pipe,
+                    reference,
+                    server_process,
+                    client_process,
+                    &startup_info);
+            }
+
+            HRESULT STDMETHODCALLTYPE EstablishPtyHandoff(
+                HANDLE* in_pipe,
+                HANDLE* out_pipe,
+                HANDLE signal_pipe,
+                HANDLE reference,
+                HANDLE server_process,
+                HANDLE client_process,
+                const TERMINAL_STARTUP_INFO* startup_info) override
+            {
+                if (_state == nullptr)
+                {
+                    return E_UNEXPECTED;
+                }
+                if (in_pipe == nullptr || out_pipe == nullptr)
+                {
+                    _state->set_failed_with_context(L"ITerminalHandoff3::EstablishPtyHandoff invalid args", E_INVALIDARG);
+                    return E_INVALIDARG;
+                }
+
+                *in_pipe = nullptr;
+                *out_pipe = nullptr;
+
+                if (!_supports_terminal_handoff)
+                {
+                    _state->set_failed_with_context(L"ITerminalHandoff3 not supported in this mode", E_NOINTERFACE);
+                    return E_NOINTERFACE;
+                }
+
+                if (!_state->try_begin_establish())
+                {
+                    const HRESULT hr = HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
+                    _state->set_failed_with_context(L"ITerminalHandoff3::EstablishPtyHandoff already called", hr);
+                    return hr;
+                }
+
+                // Create the ConPTY byte-transport pipes. The terminal keeps the write-end for
+                // stdin and the read-end for stdout; the server receives the opposite ends.
+                constexpr DWORD pipe_buffer_bytes = 64 * 1024;
+
+                core::UniqueHandle server_input_read;
+                core::UniqueHandle terminal_input_write;
+                HRESULT pipe_hr = create_pipe_pair(server_input_read, terminal_input_write, pipe_buffer_bytes);
+                if (FAILED(pipe_hr))
+                {
+                    _state->set_failed_with_context(L"ITerminalHandoff3::EstablishPtyHandoff CreatePipe(input) failed", pipe_hr);
+                    return pipe_hr;
+                }
+
+                core::UniqueHandle terminal_output_read;
+                core::UniqueHandle server_output_write;
+                pipe_hr = create_pipe_pair(terminal_output_read, server_output_write, pipe_buffer_bytes);
+                if (FAILED(pipe_hr))
+                {
+                    _state->set_failed_with_context(L"ITerminalHandoff3::EstablishPtyHandoff CreatePipe(output) failed", pipe_hr);
+                    return pipe_hr;
+                }
+
+                // Duplicate the handles we intend to keep after returning from the COM call.
+                const HRESULT dup_hr = _state->duplicate_terminal_payload(
+                    terminal_input_write.view(),
+                    terminal_output_read.view(),
+                    core::HandleView(signal_pipe),
+                    core::HandleView(reference),
+                    core::HandleView(server_process),
+                    core::HandleView(client_process),
+                    startup_info);
+                if (FAILED(dup_hr))
+                {
+                    _state->set_failed_with_context(L"ITerminalHandoff3::EstablishPtyHandoff handle duplication failed", dup_hr);
+                    return dup_hr;
+                }
+
+                *in_pipe = server_input_read.release();
+                *out_pipe = server_output_write.release();
+
+                _state->set_terminal_succeeded();
                 return S_OK;
             }
 
         private:
+            HRESULT establish_terminal_handoff_v1(
+                const HANDLE in_pipe,
+                const HANDLE out_pipe,
+                const HANDLE signal_pipe,
+                const HANDLE reference,
+                const HANDLE server_process,
+                const HANDLE client_process,
+                const TERMINAL_STARTUP_INFO* const startup_info) noexcept
+            {
+                if (_state == nullptr)
+                {
+                    return E_UNEXPECTED;
+                }
+
+                if (!_supports_terminal_handoff)
+                {
+                    _state->set_failed_with_context(L"ITerminalHandoff not supported in this mode", E_NOINTERFACE);
+                    return E_NOINTERFACE;
+                }
+
+                if (in_pipe == nullptr || out_pipe == nullptr)
+                {
+                    _state->set_failed_with_context(L"ITerminalHandoff::EstablishPtyHandoff invalid in/out pipes", E_INVALIDARG);
+                    return E_INVALIDARG;
+                }
+
+                if (!_state->try_begin_establish())
+                {
+                    const HRESULT hr = HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
+                    _state->set_failed_with_context(L"ITerminalHandoff::EstablishPtyHandoff already called", hr);
+                    return hr;
+                }
+
+                const HRESULT dup_hr = _state->duplicate_terminal_payload(
+                    core::HandleView(in_pipe),
+                    core::HandleView(out_pipe),
+                    core::HandleView(signal_pipe),
+                    core::HandleView(reference),
+                    core::HandleView(server_process),
+                    core::HandleView(client_process),
+                    startup_info);
+                if (FAILED(dup_hr))
+                {
+                    _state->set_failed_with_context(L"ITerminalHandoff::EstablishPtyHandoff handle duplication failed", dup_hr);
+                    return dup_hr;
+                }
+
+                _state->set_terminal_succeeded();
+                return S_OK;
+            }
+
             std::atomic<ULONG> _ref_count{ 1 };
             HandoffState* _state{ nullptr };
+            bool _supports_terminal_handoff{ false };
         };
 
-        class ConsoleHandoffFactory final : public IClassFactory
+        class EmbeddingHandoffFactory final : public IClassFactory
         {
         public:
-            explicit ConsoleHandoffFactory(HandoffState* const state) noexcept :
-                _state(state)
+            EmbeddingHandoffFactory(HandoffState* const state, const bool supports_terminal_handoff) noexcept :
+                _state(state),
+                _supports_terminal_handoff(supports_terminal_handoff)
             {
             }
 
@@ -559,7 +870,7 @@ namespace oc::runtime
                     return E_POINTER;
                 }
 
-                auto* created = new (std::nothrow) ConsoleHandoffObject(_state);
+                auto* created = new (std::nothrow) EmbeddingHandoffObject(_state, _supports_terminal_handoff);
                 if (created == nullptr)
                 {
                     return E_OUTOFMEMORY;
@@ -578,27 +889,22 @@ namespace oc::runtime
         private:
             std::atomic<ULONG> _ref_count{ 1 };
             HandoffState* _state{ nullptr };
+            bool _supports_terminal_handoff{ false };
         };
     }
 
     std::expected<DWORD, ComEmbeddingError> ComEmbeddingServer::run(logging::Logger& logger, const DWORD wait_timeout_ms) noexcept
     {
-        return run_with_runner(logger, wait_timeout_ms, &default_handoff_runner);
+        return run_with_runners(logger, wait_timeout_ms, nullptr, nullptr);
     }
 
-    std::expected<DWORD, ComEmbeddingError> ComEmbeddingServer::run_with_runner(
+    std::expected<DWORD, ComEmbeddingError> ComEmbeddingServer::run_with_runners(
         logging::Logger& logger,
         const DWORD wait_timeout_ms,
-        const HandoffRunner runner) noexcept
+        const HandoffRunner console_runner,
+        const TerminalHandoffRunner terminal_runner) noexcept
     {
-        if (runner == nullptr)
-        {
-            return std::unexpected(ComEmbeddingError{
-                .context = L"COM embedding runner was null",
-                .hresult = E_INVALIDARG,
-                .win32_error = ERROR_INVALID_PARAMETER,
-            });
-        }
+        const bool supports_terminal_handoff = terminal_runner != nullptr;
 
         const CoInitScope coinit(::CoInitializeEx(nullptr, COINIT_MULTITHREADED));
         if (FAILED(coinit.result()))
@@ -622,7 +928,7 @@ namespace oc::runtime
 
         HandoffState handoff_state(core::HandleView(completion_event.get()));
 
-        auto* factory = new (std::nothrow) ConsoleHandoffFactory(&handoff_state);
+        auto* factory = new (std::nothrow) EmbeddingHandoffFactory(&handoff_state, supports_terminal_handoff);
         if (factory == nullptr)
         {
             return std::unexpected(ComEmbeddingError{
@@ -663,35 +969,86 @@ namespace oc::runtime
             });
         }
 
-        if (handoff_state.state() == HandoffCompletionState::failed)
+        if (handoff_state.state() == EmbeddingCompletionState::failed)
         {
             const HRESULT hr = handoff_state.failure_hr();
+            const wchar_t* const ctx = handoff_state.failure_context();
             return std::unexpected(ComEmbeddingError{
-                .context = L"IConsoleHandoff::EstablishHandoff failed",
+                .context = ctx == nullptr ? std::wstring(L"COM embedding handoff failed") : std::wstring(ctx),
                 .hresult = hr,
                 .win32_error = to_win32_error_from_hresult(hr),
             });
         }
 
-        if (handoff_state.state() != HandoffCompletionState::succeeded)
+        if (handoff_state.state() == EmbeddingCompletionState::console_succeeded)
+        {
+            logger.log(logging::LogLevel::info, L"COM embedding handoff completed (IConsoleHandoff)");
+            ComHandoffPayload payload{};
+            payload.server_handle = handoff_state.server_handle();
+            payload.input_event = handoff_state.input_event();
+            payload.signal_pipe = handoff_state.signal_pipe();
+            payload.inbox_process = handoff_state.inbox_process();
+            payload.attach = handoff_state.attach_message();
+
+            const auto runner = console_runner != nullptr ? console_runner : &default_handoff_runner;
+            return runner(payload, logger);
+        }
+
+        if (handoff_state.state() == EmbeddingCompletionState::terminal_succeeded)
+        {
+            if (terminal_runner == nullptr)
+            {
+                return std::unexpected(ComEmbeddingError{
+                    .context = L"Terminal handoff completed, but no ITerminalHandoff runner was configured",
+                    .hresult = E_NOINTERFACE,
+                    .win32_error = ERROR_NOT_SUPPORTED,
+                });
+            }
+
+            logger.log(logging::LogLevel::info, L"COM embedding handoff completed (ITerminalHandoff)");
+            TerminalHandoffPayload payload{};
+            handoff_state.move_terminal_payload_into(payload);
+            return terminal_runner(std::move(payload), logger);
+        }
+
+        return std::unexpected(ComEmbeddingError{
+            .context = L"COM handoff completion state was not set",
+            .hresult = E_UNEXPECTED,
+            .win32_error = ERROR_GEN_FAILURE,
+        });
+    }
+
+    std::expected<DWORD, ComEmbeddingError> ComEmbeddingServer::run_with_terminal_runner(
+        logging::Logger& logger,
+        const DWORD wait_timeout_ms,
+        const TerminalHandoffRunner terminal_runner) noexcept
+    {
+        if (terminal_runner == nullptr)
         {
             return std::unexpected(ComEmbeddingError{
-                .context = L"COM handoff completion state was not set",
-                .hresult = E_UNEXPECTED,
-                .win32_error = ERROR_GEN_FAILURE,
+                .context = L"COM embedding terminal runner was null",
+                .hresult = E_INVALIDARG,
+                .win32_error = ERROR_INVALID_PARAMETER,
             });
         }
 
-        logger.log(logging::LogLevel::info, L"COM embedding handoff completed");
-        ComHandoffPayload payload{};
-        payload.server_handle = handoff_state.server_handle();
-        payload.input_event = handoff_state.input_event();
-        payload.signal_pipe = handoff_state.signal_pipe();
-        payload.inbox_process = handoff_state.inbox_process();
-        payload.attach = handoff_state.attach_message();
+        return run_with_runners(logger, wait_timeout_ms, nullptr, terminal_runner);
+    }
 
-        // TODO: capture/lifecycle management is incremental. The default runner
-        // currently transfers into the ConDrv server loop.
-        return runner(payload, logger);
+    std::expected<DWORD, ComEmbeddingError> ComEmbeddingServer::run_with_runner(
+        logging::Logger& logger,
+        const DWORD wait_timeout_ms,
+        const HandoffRunner runner) noexcept
+    {
+        if (runner == nullptr)
+        {
+            return std::unexpected(ComEmbeddingError{
+                .context = L"COM embedding runner was null",
+                .hresult = E_INVALIDARG,
+                .win32_error = ERROR_INVALID_PARAMETER,
+            });
+        }
+
+        return run_with_runners(logger, wait_timeout_ms, runner, nullptr);
     }
 }
