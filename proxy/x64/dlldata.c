@@ -19,11 +19,13 @@ extern "C"   {
 #endif
 
 EXTERN_PROXY_FILE( IConsoleHandoff )
+EXTERN_PROXY_FILE( ITerminalHandoff )
 
 
 PROXYFILE_LIST_START
 /* Start of list */
   REFERENCE_PROXY_FILE( IConsoleHandoff ),
+  REFERENCE_PROXY_FILE( ITerminalHandoff ),
 /* End of list */
 PROXYFILE_LIST_END
 

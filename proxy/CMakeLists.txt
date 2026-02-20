@@ -1,12 +1,26 @@
+set(OC_NEW_PROXY_ARCH_DIR "x64")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64" OR CMAKE_GENERATOR_PLATFORM STREQUAL "ARM64" OR CMAKE_VS_PLATFORM_NAME STREQUAL "ARM64")
+    set(OC_NEW_PROXY_ARCH_DIR "arm64")
+endif()
+
 add_library(oc_new_openconsole_proxy SHARED
-    console_handoff_proxy.cpp
-    terminal_handoff_proxy.cpp
-    console_handoff_iids.cpp
-    dlldata.cpp
+    ${OC_NEW_PROXY_ARCH_DIR}/IConsoleHandoff_p.c
+    ${OC_NEW_PROXY_ARCH_DIR}/IConsoleHandoff_i.c
+    ${OC_NEW_PROXY_ARCH_DIR}/ITerminalHandoff_p.c
+    ${OC_NEW_PROXY_ARCH_DIR}/ITerminalHandoff_i.c
+    ${OC_NEW_PROXY_ARCH_DIR}/dlldata.c
 )
 
-target_include_directories(oc_new_openconsole_proxy PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src
+# These files are MIDL-generated C sources but are compiled as C++ to keep the
+# overall project C++-only and avoid a dedicated C toolchain configuration.
+set_source_files_properties(
+    ${OC_NEW_PROXY_ARCH_DIR}/IConsoleHandoff_p.c
+    ${OC_NEW_PROXY_ARCH_DIR}/IConsoleHandoff_i.c
+    ${OC_NEW_PROXY_ARCH_DIR}/ITerminalHandoff_p.c
+    ${OC_NEW_PROXY_ARCH_DIR}/ITerminalHandoff_i.c
+    ${OC_NEW_PROXY_ARCH_DIR}/dlldata.c
+    PROPERTIES
+        LANGUAGE CXX
 )
 
 target_compile_definitions(oc_new_openconsole_proxy PRIVATE
@@ -59,6 +73,18 @@ else()
         -Wpedantic
         -Werror
         -fno-rtti
+    )
+endif()
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    # MIDL-generated proxy sources rely on a few Microsoft/COM ABI patterns
+    # that trigger clang-cl warnings under `/W4 /WX`. Keep the warnings on for
+    # the rest of the project, but silence them for the proxy/stub target.
+    target_compile_options(oc_new_openconsole_proxy PRIVATE
+        -clang:-Wno-pragma-pack
+        -clang:-Wno-missing-braces
+        -clang:-Wno-microsoft-cast
+        -clang:-Wno-unused-const-variable
     )
 endif()
 
