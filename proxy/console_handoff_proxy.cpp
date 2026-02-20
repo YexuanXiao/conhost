@@ -122,9 +122,9 @@ static const ProcFormatString IConsoleHandoff__MIDL_ProcFormatString = {
 
         /* Parameter msg */
 
-        /* 38 */ NdrFcShort(0x10a), /* Flags:  must free, in, simple ref, */
+        /* 38 */ NdrFcShort(0x10b), /* Flags:  must size, must free, in, simple ref, */
         /* 40 */ NdrFcShort(0x18), /* x86 Stack size/offset = 24 */
-        /* 42 */ NdrFcShort(0xe), /* Type Offset=14 */
+        /* 42 */ NdrFcShort(0x12), /* Type Offset=18 */
 
         /* Parameter signalPipe */
 
@@ -140,9 +140,9 @@ static const ProcFormatString IConsoleHandoff__MIDL_ProcFormatString = {
 
         /* Parameter process */
 
-        /* 56 */ NdrFcShort(0x113), /* Flags:  must size, must free, out, simple ref, */
+        /* 56 */ NdrFcShort(0x2113), /* Flags:  must size, must free, out, simple ref, srv alloc size=8 */
         /* 58 */ NdrFcShort(0x30), /* x86 Stack size/offset = 48 */
-        /* 60 */ NdrFcShort(0x30), /* Type Offset=48 */
+        /* 60 */ NdrFcShort(0x2a), /* Type Offset=42 */
 
         /* Return value */
 

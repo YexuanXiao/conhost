@@ -233,6 +233,7 @@ namespace
             L"break_on_start=true\n"
             L"debug_sink=0\n"
             L"prefer_pseudoconsole=0\n"
+            L"hold_on_exit=1\n"
             L"allow_embedding_passthrough=0\n"
             L"enable_legacy_conhost_path=0\n"
             L"embedding_wait_timeout_ms=1500\n");
@@ -249,6 +250,7 @@ namespace
                parsed->break_on_start &&
                !parsed->enable_debug_sink &&
                !parsed->prefer_pseudoconsole &&
+               parsed->hold_window_on_exit &&
                !parsed->allow_embedding_passthrough &&
                !parsed->enable_legacy_conhost_path &&
                parsed->embedding_wait_timeout_ms == 1500;
@@ -270,6 +272,7 @@ namespace
         const ScopedEnvironmentVariable break_on_start(L"OPENCONSOLE_NEW_BREAK_ON_START", std::optional<std::wstring>(L"1"));
         const ScopedEnvironmentVariable debug_sink(L"OPENCONSOLE_NEW_DEBUG_SINK", std::optional<std::wstring>(L"false"));
         const ScopedEnvironmentVariable prefer_pty(L"OPENCONSOLE_NEW_PREFER_PTY", std::optional<std::wstring>(L"0"));
+        const ScopedEnvironmentVariable hold_on_exit(L"OPENCONSOLE_NEW_HOLD_ON_EXIT", std::optional<std::wstring>(L"1"));
         const ScopedEnvironmentVariable embedding_passthrough(L"OPENCONSOLE_NEW_ALLOW_EMBEDDING_PASSTHROUGH", std::optional<std::wstring>(L"0"));
         const ScopedEnvironmentVariable legacy_path(L"OPENCONSOLE_NEW_ENABLE_LEGACY_PATH", std::optional<std::wstring>(L"0"));
         const ScopedEnvironmentVariable embedding_wait(L"OPENCONSOLE_NEW_EMBEDDING_WAIT_MS", std::optional<std::wstring>(L"220"));
@@ -289,6 +292,7 @@ namespace
                loaded->break_on_start &&
                !loaded->enable_debug_sink &&
                !loaded->prefer_pseudoconsole &&
+               loaded->hold_window_on_exit &&
                !loaded->allow_embedding_passthrough &&
                !loaded->enable_legacy_conhost_path &&
                loaded->embedding_wait_timeout_ms == 220;

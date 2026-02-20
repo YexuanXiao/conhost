@@ -87,6 +87,10 @@ namespace oc::runtime
 
         // When true, suppress default-terminal delegation for server startups.
         bool force_no_handoff{ false };
+
+        // When true (create-server windowed terminal mode), keep the window open
+        // after the hosted client exits and append an exit-code message.
+        bool hold_window_on_exit{ false };
     };
 
     struct SessionError final

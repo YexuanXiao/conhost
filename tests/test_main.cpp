@@ -12,6 +12,7 @@ bool run_server_handle_validator_tests();
 bool run_startup_command_tests();
 bool run_fast_number_tests();
 bool run_session_tests();
+bool run_utf8_stream_decoder_tests();
 bool run_signal_pipe_monitor_tests();
 bool run_com_embedding_server_tests();
 bool run_com_embedding_integration_tests();
@@ -112,6 +113,13 @@ int main()
     if (!run_session_tests())
     {
         fwprintf(stderr, L"[FAIL] session tests\n");
+        ++failed;
+    }
+
+    trace(L"utf8 stream decoder");
+    if (!run_utf8_stream_decoder_tests())
+    {
+        fwprintf(stderr, L"[FAIL] utf8 stream decoder tests\n");
         ++failed;
     }
 

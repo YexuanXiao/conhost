@@ -1,5 +1,15 @@
 # Progress Log
 
+## 2026-02-20
+- Fixed direct `openconsole_new` startup to always host the client inside an `openconsole_new` window:
+  - direct create-server launches no longer run the client by inheriting stdio (which could cause Windows to spawn the configured system default terminal).
+  - added a windowed ConPTY hosting path that renders ConPTY output inside the in-process window via `condrv::ScreenBuffer` snapshots.
+- Added hold-on-exit behavior for the windowed terminal host:
+  - config key `hold_on_exit=0|1` (alias `hold_window_on_exit`).
+  - environment override `OPENCONSOLE_NEW_HOLD_ON_EXIT=0|1`.
+  - when enabled, the window stays open and appends `[process exited with code N]` to the terminal buffer.
+- Added a streaming UTF-8 decoder utility (`core::Utf8StreamDecoder`) and unit tests for split/invalid sequences.
+
 ## 2026-02-18
 - Decoupled GUI and non-GUI layers for classic window rendering:
   - moved the immutable viewport snapshot types to a neutral `view/` module (`view::ScreenBufferSnapshot`, `view::PublishedScreenBuffer`).

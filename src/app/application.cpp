@@ -223,6 +223,7 @@ namespace oc::app
         session_options.inherit_cursor = args.inherit_cursor();
         session_options.text_measurement = args.text_measurement();
         session_options.force_no_handoff = args.force_no_handoff();
+        session_options.hold_window_on_exit = config.hold_window_on_exit;
 
         if (!session_options.host_input)
         {

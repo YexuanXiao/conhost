@@ -26,22 +26,6 @@ namespace
         return true;
     }
 
-    bool test_inherited_stdio_exit_code()
-    {
-        oc::logging::Logger logger = make_logger();
-
-        oc::runtime::SessionOptions options{};
-        options.client_command_line = L"%ComSpec% /c exit 13";
-        options.create_server_handle = true;
-        options.host_input = oc::core::HandleView(::GetStdHandle(STD_INPUT_HANDLE));
-        options.host_output = oc::core::HandleView(::GetStdHandle(STD_OUTPUT_HANDLE));
-        options.in_conpty_mode = false;
-        options.headless = false;
-
-        const auto result = oc::runtime::Session::run(options, logger);
-        return result.has_value() && *result == 13;
-    }
-
     bool test_pseudoconsole_exit_code()
     {
         oc::logging::Logger logger = make_logger();
@@ -107,8 +91,7 @@ namespace
 
 bool run_session_tests()
 {
-    return test_inherited_stdio_exit_code() &&
-           test_pseudoconsole_exit_code() &&
+    return test_pseudoconsole_exit_code() &&
            test_empty_command_with_signaled_event() &&
            test_server_handle_validation_failure();
 }

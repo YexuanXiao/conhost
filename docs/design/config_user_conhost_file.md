@@ -55,11 +55,16 @@ Logging-specific keys:
 - `log_dir=<path>` (also implicitly enables file logging when non-empty)
 - `break_on_start=0|1` (default `0`)
 
+Terminal window behavior keys:
+
+- `hold_on_exit=0|1` (alias `hold_window_on_exit`, default `0`)
+
 Environment overrides:
 
 - `OPENCONSOLE_NEW_ENABLE_FILE_LOGGING`
 - `OPENCONSOLE_NEW_LOG_DIR`
 - `OPENCONSOLE_NEW_BREAK_ON_START`
+- `OPENCONSOLE_NEW_HOLD_ON_EXIT`
 
 When file logging is enabled and `log_dir` is empty, runtime chooses:
 

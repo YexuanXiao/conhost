@@ -11,6 +11,7 @@ add_executable(oc_new_tests
     startup_command_tests.cpp
     fast_number_tests.cpp
     session_tests.cpp
+    utf8_stream_decoder_tests.cpp
     com_embedding_server_tests.cpp
     com_embedding_integration_tests.cpp
     host_signals_tests.cpp

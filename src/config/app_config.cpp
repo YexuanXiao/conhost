@@ -29,6 +29,7 @@ namespace oc::config
         constexpr std::wstring_view kBreakOnStartEnv = L"OPENCONSOLE_NEW_BREAK_ON_START";
         constexpr std::wstring_view kDebugSinkEnv = L"OPENCONSOLE_NEW_DEBUG_SINK";
         constexpr std::wstring_view kPreferPtyEnv = L"OPENCONSOLE_NEW_PREFER_PTY";
+        constexpr std::wstring_view kHoldOnExitEnv = L"OPENCONSOLE_NEW_HOLD_ON_EXIT";
         constexpr std::wstring_view kEmbeddingPassthroughEnv = L"OPENCONSOLE_NEW_ALLOW_EMBEDDING_PASSTHROUGH";
         constexpr std::wstring_view kLegacyPathEnv = L"OPENCONSOLE_NEW_ENABLE_LEGACY_PATH";
         constexpr std::wstring_view kEmbeddingWaitEnv = L"OPENCONSOLE_NEW_EMBEDDING_WAIT_MS";
@@ -353,6 +354,11 @@ namespace oc::config
                 config.prefer_pseudoconsole = parse_bool(value);
                 return;
             }
+            if (key == L"hold_on_exit" || key == L"hold_window_on_exit")
+            {
+                config.hold_window_on_exit = parse_bool(value);
+                return;
+            }
             if (key == L"allow_embedding_passthrough")
             {
                 config.allow_embedding_passthrough = parse_bool(value);
@@ -408,6 +414,10 @@ namespace oc::config
             if (const auto value = read_environment(kPreferPtyEnv))
             {
                 config.prefer_pseudoconsole = parse_bool(*value);
+            }
+            if (const auto value = read_environment(kHoldOnExitEnv))
+            {
+                config.hold_window_on_exit = parse_bool(*value);
             }
             if (const auto value = read_environment(kEmbeddingPassthroughEnv))
             {

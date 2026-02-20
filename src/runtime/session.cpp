@@ -5,6 +5,7 @@
 #include "core/assert.hpp"
 #include "core/handle_view.hpp"
 #include "core/host_signals.hpp"
+#include "core/utf8_stream_decoder.hpp"
 #include "core/unique_handle.hpp"
 #include "core/win32_handle.hpp"
 #include "core/win32_wait.hpp"
@@ -1405,93 +1406,6 @@ namespace oc::runtime
             return process;
         }
 
-        [[nodiscard]] std::expected<core::UniqueHandle, SessionError> spawn_process_inherited_stdio(
-            const std::wstring& command_line,
-            core::HandleView std_in,
-            core::HandleView std_out,
-            logging::Logger& logger)
-        {
-            const auto expanded_command_line = [&]() -> std::expected<std::wstring, SessionError> {
-                const DWORD required = ::ExpandEnvironmentStringsW(command_line.c_str(), nullptr, 0);
-                if (required == 0)
-                {
-                    return std::unexpected(SessionError{
-                        .context = L"ExpandEnvironmentStringsW failed",
-                        .win32_error = ::GetLastError(),
-                    });
-                }
-
-                std::wstring expanded(required, L'\0');
-                const DWORD written = ::ExpandEnvironmentStringsW(command_line.c_str(), expanded.data(), required);
-                if (written == 0 || written > required)
-                {
-                    return std::unexpected(SessionError{
-                        .context = L"ExpandEnvironmentStringsW write failed",
-                        .win32_error = ::GetLastError(),
-                    });
-                }
-                expanded.resize(written - 1);
-                return expanded;
-            }();
-            if (!expanded_command_line)
-            {
-                return std::unexpected(expanded_command_line.error());
-            }
-
-            logger.log(
-                logging::LogLevel::info,
-                L"Launching client process (inherited stdio): command_line={}",
-                expanded_command_line.value());
-
-            std::vector<wchar_t> mutable_command_line(
-                expanded_command_line->begin(),
-                expanded_command_line->end());
-            mutable_command_line.push_back(L'\0');
-
-            STARTUPINFOW startup{};
-            startup.cb = sizeof(startup);
-            startup.dwFlags = STARTF_USESTDHANDLES;
-            startup.hStdInput = std_in.get();
-            startup.hStdOutput = std_out.get();
-            startup.hStdError = std_out.get();
-
-            PROCESS_INFORMATION info{};
-            const BOOL created = ::CreateProcessW(
-                nullptr,
-                mutable_command_line.data(),
-                nullptr,
-                nullptr,
-                TRUE,
-                0,
-                nullptr,
-                nullptr,
-                &startup,
-                &info);
-            if (created == FALSE)
-            {
-                const DWORD create_error = ::GetLastError();
-                logger.log(
-                    logging::LogLevel::error,
-                    L"CreateProcessW failed for inherited-stdio client launch: error={}, command_line={}",
-                    create_error,
-                    expanded_command_line.value());
-                return std::unexpected(SessionError{
-                    .context = L"CreateProcessW inherited stdio failed",
-                    .win32_error = create_error,
-                });
-            }
-
-            core::UniqueHandle process(info.hProcess);
-            core::UniqueHandle thread(info.hThread);
-            OC_ASSERT(process.valid());
-            OC_ASSERT(thread.valid());
-            logger.log(
-                logging::LogLevel::info,
-                L"Client process launched (inherited stdio): pid={}",
-                info.dwProcessId);
-            return process;
-        }
-
         [[nodiscard]] std::expected<void, SessionError> write_bytes(core::HandleView target, const char* data, const DWORD size)
         {
             if (size == 0)
@@ -2019,73 +1933,453 @@ namespace oc::runtime
             return exit_code;
         }
 
-        [[nodiscard]] std::expected<DWORD, SessionError> run_with_inherited_stdio(const SessionOptions& options, logging::Logger& logger)
+        constexpr ULONG k_terminal_output_mode =
+            ENABLE_PROCESSED_OUTPUT |
+            ENABLE_WRAP_AT_EOL_OUTPUT |
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING |
+            DISABLE_NEWLINE_AUTO_RETURN;
+
+        struct WindowedPtyContext final
         {
-            auto process_result = spawn_process_inherited_stdio(
-                options.client_command_line,
-                options.host_input,
-                options.host_output,
-                logger);
+            core::HandleView stop_event{};
+            logging::Logger* logger{};
+            HWND window{};
+            std::shared_ptr<view::PublishedScreenBuffer> published_screen;
+            std::shared_ptr<condrv::ScreenBuffer> screen_buffer;
+
+            core::UniqueHandle process;
+            core::UniqueHandle pty_output_read;
+
+            DWORD exit_code{ 0 };
+            SessionError error{};
+            bool succeeded{ false };
+            bool hold_window_on_exit{ false };
+        };
+
+        void publish_terminal_snapshot_best_effort(WindowedPtyContext& context) noexcept
+        {
+            if (!context.published_screen || !context.screen_buffer)
+            {
+                return;
+            }
+
+            const auto snapshot = condrv::make_viewport_snapshot(*context.screen_buffer);
+            if (!snapshot)
+            {
+                return;
+            }
+
+            context.published_screen->publish(snapshot.value());
+            if (context.window != nullptr)
+            {
+                (void)::PostMessageW(context.window, WM_APP + 1, 0, 0);
+            }
+        }
+
+        DWORD WINAPI windowed_pty_output_thread_proc(void* param)
+        {
+            auto* context = static_cast<WindowedPtyContext*>(param);
+            if (context == nullptr || context->logger == nullptr || !context->process.valid() || !context->pty_output_read.valid() ||
+                !context->screen_buffer || !context->published_screen)
+            {
+                return 0;
+            }
+
+            bool canceled = false;
+            try
+            {
+                core::Utf8StreamDecoder decoder;
+
+                bool process_exited = false;
+                bool draining_after_exit = false;
+                ULONGLONG drain_start_tick = 0;
+                static constexpr ULONGLONG kDrainTimeoutMs = 2'000;
+
+                for (;;)
+                {
+                    if (context->stop_event)
+                    {
+                        const DWORD stop_state = ::WaitForSingleObject(context->stop_event.get(), 0);
+                        if (stop_state == WAIT_OBJECT_0)
+                        {
+                            canceled = true;
+                            break;
+                        }
+                        if (stop_state == WAIT_FAILED)
+                        {
+                            context->error = SessionError{
+                                .context = L"WaitForSingleObject failed for windowed terminal stop event",
+                                .win32_error = ::GetLastError(),
+                            };
+                            context->succeeded = false;
+                            return 0;
+                        }
+                    }
+
+                    const DWORD process_state = ::WaitForSingleObject(context->process.get(), 0);
+                    if (process_state == WAIT_OBJECT_0)
+                    {
+                        process_exited = true;
+                    }
+                    else if (process_state == WAIT_FAILED)
+                    {
+                        context->error = SessionError{
+                            .context = L"WaitForSingleObject failed for windowed terminal client process",
+                            .win32_error = ::GetLastError(),
+                        };
+                        context->succeeded = false;
+                        return 0;
+                    }
+
+                    DWORD available = 0;
+                    if (::PeekNamedPipe(context->pty_output_read.get(), nullptr, 0, nullptr, &available, nullptr) == FALSE)
+                    {
+                        const DWORD peek_error = ::GetLastError();
+                        if (peek_error == ERROR_BROKEN_PIPE || peek_error == ERROR_NO_DATA || peek_error == ERROR_PIPE_NOT_CONNECTED ||
+                            peek_error == ERROR_OPERATION_ABORTED)
+                        {
+                            break;
+                        }
+
+                        context->error = SessionError{
+                            .context = L"PeekNamedPipe failed for windowed terminal output",
+                            .win32_error = peek_error,
+                        };
+                        context->succeeded = false;
+                        return 0;
+                    }
+
+                    bool had_output = false;
+                    if (available != 0)
+                    {
+                        std::array<std::byte, 8192> buffer{};
+                        const DWORD to_read = available < buffer.size() ? available : static_cast<DWORD>(buffer.size());
+
+                        DWORD read = 0;
+                        if (::ReadFile(context->pty_output_read.get(), buffer.data(), to_read, &read, nullptr) == FALSE)
+                        {
+                            const DWORD read_error = ::GetLastError();
+                            if (read_error == ERROR_BROKEN_PIPE || read_error == ERROR_NO_DATA || read_error == ERROR_PIPE_NOT_CONNECTED ||
+                                read_error == ERROR_OPERATION_ABORTED)
+                            {
+                                break;
+                            }
+
+                            context->error = SessionError{
+                                .context = L"ReadFile failed for windowed terminal output",
+                                .win32_error = read_error,
+                            };
+                            context->succeeded = false;
+                            return 0;
+                        }
+
+                        if (read != 0)
+                        {
+                            had_output = true;
+                            const auto chunk = std::span<const std::byte>(buffer.data(), static_cast<size_t>(read));
+                            std::wstring decoded = decoder.decode_append(chunk);
+                            if (!decoded.empty())
+                            {
+                                condrv::apply_text_to_screen_buffer<condrv::NullHostIo>(
+                                    *context->screen_buffer,
+                                    decoded,
+                                    k_terminal_output_mode,
+                                    nullptr,
+                                    nullptr);
+                                publish_terminal_snapshot_best_effort(*context);
+                            }
+                        }
+
+                        if (had_output)
+                        {
+                            draining_after_exit = false;
+                        }
+                    }
+
+                    if (process_exited)
+                    {
+                        if (!had_output)
+                        {
+                            if (!draining_after_exit)
+                            {
+                                draining_after_exit = true;
+                                drain_start_tick = ::GetTickCount64();
+                            }
+                            else if ((::GetTickCount64() - drain_start_tick) >= kDrainTimeoutMs)
+                            {
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!had_output)
+                    {
+                        ::Sleep(1);
+                    }
+                }
+
+                DWORD exit_code = 0;
+                if (::GetExitCodeProcess(context->process.get(), &exit_code) == FALSE)
+                {
+                    context->error = SessionError{
+                        .context = L"GetExitCodeProcess failed for windowed terminal client",
+                        .win32_error = ::GetLastError(),
+                    };
+                    context->succeeded = false;
+                    return 0;
+                }
+
+                context->exit_code = exit_code;
+                context->succeeded = true;
+
+                if (!canceled)
+                {
+                    if (context->hold_window_on_exit)
+                    {
+                        wchar_t message[96]{};
+                        _snwprintf_s(
+                            message,
+                            _TRUNCATE,
+                            L"\r\n[process exited with code %lu]\r\n",
+                            static_cast<unsigned long>(exit_code));
+
+                        condrv::apply_text_to_screen_buffer<condrv::NullHostIo>(
+                            *context->screen_buffer,
+                            std::wstring_view(message),
+                            k_terminal_output_mode,
+                            nullptr,
+                            nullptr);
+                        publish_terminal_snapshot_best_effort(*context);
+                    }
+                    else if (context->window != nullptr)
+                    {
+                        (void)::PostMessageW(context->window, WM_CLOSE, 0, 0);
+                    }
+                }
+
+                return 0;
+            }
+            catch (...)
+            {
+                context->error = SessionError{
+                    .context = L"Unhandled exception in windowed terminal output thread",
+                    .win32_error = ERROR_GEN_FAILURE,
+                };
+                context->succeeded = false;
+
+                if (!canceled && context->window != nullptr)
+                {
+                    (void)::PostMessageW(context->window, WM_CLOSE, 0, 0);
+                }
+
+                return 0;
+            }
+        }
+
+        [[nodiscard]] std::expected<DWORD, SessionError> run_windowed_pseudoconsole_terminal(const SessionOptions& options, logging::Logger& logger) noexcept
+        {
+            auto stop_event = core::create_event(true, false, nullptr);
+            if (!stop_event)
+            {
+                return std::unexpected(SessionError{
+                    .context = L"CreateEventW failed for windowed terminal stop event",
+                    .win32_error = stop_event.error(),
+                });
+            }
+
+            std::shared_ptr<view::PublishedScreenBuffer> published_screen;
+            try
+            {
+                published_screen = std::make_shared<view::PublishedScreenBuffer>();
+            }
+            catch (...)
+            {
+                return std::unexpected(SessionError{
+                    .context = L"Failed to allocate published screen buffer for windowed terminal",
+                    .win32_error = ERROR_OUTOFMEMORY,
+                });
+            }
+
+            const COORD initial_size = calculate_initial_size(options);
+            condrv::ScreenBuffer::Settings settings = condrv::ScreenBuffer::default_settings();
+            settings.buffer_size = initial_size;
+            settings.window_size = initial_size;
+            settings.maximum_window_size = initial_size;
+
+            auto screen_buffer_result = condrv::ScreenBuffer::create(std::move(settings));
+            if (!screen_buffer_result)
+            {
+                return std::unexpected(SessionError{
+                    .context = screen_buffer_result.error().context,
+                    .win32_error = screen_buffer_result.error().win32_error,
+                });
+            }
+
+            std::shared_ptr<condrv::ScreenBuffer> screen_buffer = std::move(screen_buffer_result.value());
+
+            WindowedPtyContext context{};
+            context.stop_event = stop_event->view();
+            context.logger = &logger;
+            context.published_screen = published_screen;
+            context.screen_buffer = screen_buffer;
+            context.hold_window_on_exit = options.hold_window_on_exit;
+
+            publish_terminal_snapshot_best_effort(context);
+
+            core::UniqueHandle pty_input_read;
+            core::UniqueHandle pty_input_write;
+            core::UniqueHandle pty_output_read;
+            core::UniqueHandle pty_output_write;
+
+            if (auto pipe_result = create_pipe(pty_input_read, pty_input_write); !pipe_result)
+            {
+                return std::unexpected(pipe_result.error());
+            }
+            if (auto pipe_result = create_pipe(pty_output_read, pty_output_write); !pipe_result)
+            {
+                return std::unexpected(pipe_result.error());
+            }
+
+            HPCON raw_pseudo_console = nullptr;
+            const HRESULT pty_result = ::CreatePseudoConsole(
+                initial_size,
+                pty_input_read.get(),
+                pty_output_write.get(),
+                0,
+                &raw_pseudo_console);
+            if (FAILED(pty_result))
+            {
+                return std::unexpected(SessionError{
+                    .context = L"CreatePseudoConsole failed for windowed terminal",
+                    .win32_error = static_cast<DWORD>(HRESULT_CODE(pty_result)),
+                });
+            }
+
+            UniquePseudoConsole pseudo_console(raw_pseudo_console);
+
+            // The ConPTY transport pipes must not leak into the client process.
+            (void)::SetHandleInformation(pty_input_write.get(), HANDLE_FLAG_INHERIT, 0);
+            (void)::SetHandleInformation(pty_output_read.get(), HANDLE_FLAG_INHERIT, 0);
+            (void)::SetHandleInformation(pty_input_read.get(), HANDLE_FLAG_INHERIT, 0);
+            (void)::SetHandleInformation(pty_output_write.get(), HANDLE_FLAG_INHERIT, 0);
+
+            auto attributes_result = ProcThreadAttributeList::create();
+            if (!attributes_result)
+            {
+                return std::unexpected(attributes_result.error());
+            }
+
+            ProcThreadAttributeList attributes = std::move(attributes_result.value());
+            if (auto update_result = attributes.set_pseudo_console(pseudo_console.get()); !update_result)
+            {
+                return std::unexpected(update_result.error());
+            }
+
+            auto process_result = spawn_process_with_pseudoconsole(options.client_command_line, attributes, logger);
             if (!process_result)
             {
                 return std::unexpected(process_result.error());
             }
 
-            core::UniqueHandle process = std::move(process_result.value());
+            context.process = std::move(process_result.value());
+            context.pty_output_read = std::move(pty_output_read);
 
-            if (options.signal_handle)
-            {
-                const DWORD wait_result = core::wait_for_two_objects(
-                    process.view(),
-                    options.signal_handle,
-                    false,
-                    INFINITE);
-                if (wait_result == WAIT_OBJECT_0 + 1)
-                {
-                    if (::TerminateProcess(process.get(), ERROR_CANCELLED) == FALSE)
-                    {
-                        logger.log(
-                            logging::LogLevel::warning,
-                            L"TerminateProcess failed after inherited-stdio signal shutdown request (error={})",
-                            ::GetLastError());
-                    }
-                    else
-                    {
-                        logger.log(
-                            logging::LogLevel::info,
-                            L"Signal handle requested shutdown; terminated inherited-stdio client process");
-                    }
-                }
-                else if (wait_result != WAIT_OBJECT_0)
-                {
-                    return std::unexpected(SessionError{
-                        .context = L"WaitForMultipleObjects failed",
-                        .win32_error = ::GetLastError(),
-                    });
-                }
-            }
-            else
-            {
-                const DWORD wait_result = ::WaitForSingleObject(process.get(), INFINITE);
-                if (wait_result != WAIT_OBJECT_0)
-                {
-                    return std::unexpected(SessionError{
-                        .context = L"WaitForSingleObject failed",
-                        .win32_error = ::GetLastError(),
-                    });
-                }
-            }
+            // These ends are owned by the pseudo console host after creation.
+            pty_input_read.reset();
+            pty_output_write.reset();
 
-            DWORD exit_code = 0;
-            if (::GetExitCodeProcess(process.get(), &exit_code) == FALSE)
+            std::shared_ptr<renderer::IWindowInputSink> input_sink;
+            try
+            {
+                input_sink = std::make_shared<WindowInputPipeSink>(std::move(pty_input_write));
+            }
+            catch (...)
             {
                 return std::unexpected(SessionError{
-                    .context = L"GetExitCodeProcess failed",
+                    .context = L"Failed to allocate windowed terminal input sink",
+                    .win32_error = ERROR_OUTOFMEMORY,
+                });
+            }
+
+            renderer::WindowHostConfig window_config{};
+            window_config.title = L"openconsole_new";
+            window_config.show_command = SW_SHOWNORMAL;
+            window_config.published_screen = published_screen;
+            window_config.input_sink = std::move(input_sink);
+
+            auto window = renderer::WindowHost::create(std::move(window_config), stop_event->view());
+            if (!window)
+            {
+                return std::unexpected(SessionError{
+                    .context = L"Failed to create window host for windowed terminal",
+                    .win32_error = core::to_dword(window.error()),
+                });
+            }
+
+            context.window = (*window)->hwnd();
+
+            core::UniqueHandle output_thread(::CreateThread(
+                nullptr,
+                0,
+                &windowed_pty_output_thread_proc,
+                &context,
+                0,
+                nullptr));
+            if (!output_thread.valid())
+            {
+                return std::unexpected(SessionError{
+                    .context = L"CreateThread failed for windowed terminal output worker",
                     .win32_error = ::GetLastError(),
                 });
             }
 
-            logger.log(logging::LogLevel::info, L"Inherited-stdio client process exited with code {}", exit_code);
+            (void)(*window)->run();
+
+            // Window closure implies session termination. Ensure the client is not left running.
+            (void)::SetEvent(stop_event->get());
+
+            DWORD current_exit = 0;
+            if (context.process.valid() && ::GetExitCodeProcess(context.process.get(), &current_exit) != FALSE && current_exit == STILL_ACTIVE)
+            {
+                (void)::TerminateProcess(context.process.get(), ERROR_CANCELLED);
+            }
+
+            // Ensure the worker thread unblocks if it is inside ReadFile/PeekNamedPipe.
+            (void)::CancelSynchronousIo(output_thread.get());
+            if (context.pty_output_read.valid())
+            {
+                (void)::CancelIoEx(context.pty_output_read.get(), nullptr);
+            }
+
+            constexpr DWORD worker_shutdown_timeout_ms = 5'000;
+            const DWORD wait_result = ::WaitForSingleObject(output_thread.get(), worker_shutdown_timeout_ms);
+            if (wait_result == WAIT_TIMEOUT)
+            {
+                logger.log(logging::LogLevel::error, L"Windowed terminal output worker did not exit within {}ms; forcing process exit", worker_shutdown_timeout_ms);
+                ::ExitProcess(ERROR_TIMEOUT);
+            }
+            if (wait_result != WAIT_OBJECT_0)
+            {
+                const DWORD error = ::GetLastError();
+                logger.log(logging::LogLevel::error, L"WaitForSingleObject failed for windowed terminal output worker (error={}); forcing process exit", error);
+                ::ExitProcess(error == 0 ? ERROR_GEN_FAILURE : error);
+            }
+
+            if (!context.succeeded)
+            {
+                return std::unexpected(context.error);
+            }
+
+            // When the output worker is canceled (user closed the window early),
+            // it may not have observed the final process exit code yet. Prefer
+            // the current exit code if available.
+            DWORD exit_code = context.exit_code;
+            if (context.process.valid() && ::GetExitCodeProcess(context.process.get(), &current_exit) != FALSE && current_exit != STILL_ACTIVE)
+            {
+                exit_code = current_exit;
+            }
+
+            logger.log(logging::LogLevel::info, L"Windowed terminal client process exited with code {}", exit_code);
             return exit_code;
         }
     }
@@ -2099,7 +2393,7 @@ namespace oc::runtime
         // keep the branching readable by:
         // - validating inherited handles up-front,
         // - keeping each branch in a compact helper (`run_with_pseudoconsole`,
-        //   `run_windowed_server`, `run_with_inherited_stdio`),
+        //   `run_windowed_server`, `run_windowed_pseudoconsole_terminal`),
         // - storing only the small pieces of state that need to survive across
         //   fallbacks (for example `initial_packet` when we already consumed a
         //   `READ_IO` during a delegation probe).
@@ -2884,6 +3178,8 @@ namespace oc::runtime
             return run_with_pseudoconsole(options, logger);
         }
 
-        return run_with_inherited_stdio(options, logger);
+        // Direct create-server startup should host the client inside an `openconsole_new`
+        // window instead of delegating UI creation to the system's default terminal.
+        return run_windowed_pseudoconsole_terminal(options, logger);
     }
 }

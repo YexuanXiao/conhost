@@ -26,6 +26,7 @@ namespace oc::config
         std::wstring log_directory_path;
         bool break_on_start{ false };
         bool prefer_pseudoconsole{ true };
+        bool hold_window_on_exit{ false };
         bool allow_embedding_passthrough{ true };
         bool enable_legacy_conhost_path{ true };
         DWORD embedding_wait_timeout_ms{ 0 };
